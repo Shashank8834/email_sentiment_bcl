@@ -1,0 +1,48 @@
+﻿version: "3.8"
+
+services:
+  monitor:
+    build:
+      context: ./monitor
+    container_name: email_monitor
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./monitor:/app
+    restart: unless-stopped
+    networks:
+      - email-monitor-network
+
+  dashboard:
+    build:
+      context: ./dashboard
+    container_name: email_dashboard
+    env_file: .env
+    command: ["python", "app.py"]
+    ports:
+      - "8050:8050"
+    volumes:
+      - ./data:/data
+      - ./dashboard:/app
+    restart: unless-stopped
+    networks:
+      - email-monitor-network
+
+  admin:
+    build:
+      context: ./dashboard
+    container_name: email_admin_dashboard
+    env_file: .env
+    command: ["python", "admin.py"]
+    ports:
+      - "8051:8051"
+    volumes:
+      - ./data:/data
+      - ./dashboard:/app
+    restart: unless-stopped
+    networks:
+      - email-monitor-network
+
+networks:
+  email-monitor-network:
+    driver: bridge

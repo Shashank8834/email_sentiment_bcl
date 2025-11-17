@@ -1,0 +1,4 @@
+﻿msal
+requests
+transformers
+numpy

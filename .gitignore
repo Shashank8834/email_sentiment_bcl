@@ -1,0 +1,53 @@
+# Environment variables
+.env
+.env.local
+.env.production
+*.env
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Data directory - EXCEPT model folder
+data/*
+!data/model/
+!data/model/**
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# SSL certificates
+nginx/ssl/
+certbot/
+
+# htpasswd
+nginx/.htpasswd
+
+# Backups
+backups/
+*.backup
+
+# Temp files
+tmp/
+temp/
+*.tmp

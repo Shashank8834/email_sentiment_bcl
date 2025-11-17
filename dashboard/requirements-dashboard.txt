@@ -1,0 +1,10 @@
+streamlit
+pandas
+matplotlib
+plotly
+python-dotenv
+numpy
+dash
+dash-bootstrap-components
+gunicorn
+pytz

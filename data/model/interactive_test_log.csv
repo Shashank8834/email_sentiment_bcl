@@ -1,0 +1,16 @@
+text,pred_idx,pred_label,prob_neg,prob_neu,prob_pos,final_idx,final_label,reason
+"Hi All, I was hoping to get more clarity on the points discussed during the client call. I might have missed a few details.",0,Negative,0.9988420605659485,0.0010823672637343407,7.562063547084108e-05,0,Negative,original
+"Hello, I understand there are a few challenges, but could you please share an update on the corrective action plan?",0,Negative,0.9849134087562561,0.0077920411713421345,0.0072944858111441135,0,Negative,original
+"Hi Team, I just wanted to thank you all for the excellent work on the audit. The client was thrilled with the outcome, and your dedication really showed.",2,Positive,0.00022782522137276828,0.0005798368365503848,0.9991922974586487,2,Positive,original
+"Hello, The revised financial statements look great! Everything is clear and professionally done. Keep up the wonderful work.",2,Positive,0.0005355465109460056,0.0005855293711647391,0.9988788962364197,2,Positive,original
+"Hi, Just checking if the meeting at 3 PM is still scheduled as planned.",0,Negative,0.9411543011665344,0.05560430511832237,0.0032414488960057497,0,Negative,original
+"Hello Team, Great job closing the report ahead of schedule. This sets a strong standard for future projects.",2,Positive,0.00013253602082841098,0.0004494912573136389,0.9994180202484131,2,Positive,original
+"Hi, The presentation for the board meeting was outstanding — concise, insightful, and well-structured. Kudos to everyone involved!",2,Positive,0.0003840845020022243,0.0007117001223377883,0.9989042282104492,2,Positive,original
+"Hi, The data uploaded to the system was incomplete again. This recurring problem needs immediate attention.",0,Negative,0.9981532692909241,0.0018171655246987939,2.9522914701374248e-05,0,Negative,original
+"Dear Ananya, I expected better follow-up on the pending reconciliations. Please ensure this doesn’t repeat going forward.",0,Negative,0.9951010346412659,0.0033759621437639,0.0015230298740789294,0,Negative,original
+"Hello, Please confirm if you received the files I sent earlier today.",1,Neutral,0.1077306941151619,0.8806623220443726,0.011606885120272636,1,Neutral,original
+"Dear Team, I’ve attached the final version of the agreement. Kindly review and share your feedback by tomorrow.",1,Neutral,0.1382119506597519,0.8273409008979797,0.034447185695171356,1,Neutral,original
+"Hello, I’m a bit concerned about the progress of the recent assignment. Could you please share an update on where things currently stand?",0,Negative,0.99989914894104,8.762015204411e-05,1.3267313079268206e-05,0,Negative,original
+"Hi Team, The report seems to be taking longer than expected. Please let me know if there are any challenges we should address.",0,Negative,0.9900153279304504,0.008639857172966003,0.00134479277767241,0,Negative,original
+"Dear Rohan, I wasn’t able to follow some parts of yesterday’s discussion. Could you please send a short summary or next steps?",0,Negative,0.9981947541236877,0.001760676153935492,4.462899960344657e-05,0,Negative,original
+"Hi, This is to inform you that the internal audit will begin next Monday.",1,Neutral,0.13283339142799377,0.8637363910675049,0.0034301825799047947,1,Neutral,original
