@@ -263,7 +263,11 @@ def live_page_layout(df_all):
                 dbc.Button("🔴 Negative Only", id='table-btn-negative', color='danger', size='sm'),
                 dbc.Button("🟡 Neutral Only", id='table-btn-neutral', color='warning', size='sm'),
                 dbc.Button("🟢 Positive Only", id='table-btn-positive', color='success', size='sm')
-            ]), width=12)
+            ]), width=6),
+            dbc.Col([
+                html.Label("Filter by Client Domain", className='me-2'),
+                dcc.Dropdown(id='live-client-filter', placeholder='Select client domain...', clearable=True)
+            ], width=6)
         ], className='mb-2'),
         html.Div(id='email-count-display', className='mb-2'),
         html.Div(id='live-feed-table'),
@@ -391,7 +395,7 @@ def update_live_charts(selected_mailbox, data_json):
         fig_today = create_pie_chart(dc,'Count','Sentiment',f"Today's Sentiment ({len(df_today)} emails)")
     
     # Activity chart
-    display['hour_ist'] = to_ist(display['processed_at']).dt.floor('H')
+    display['hour_ist'] = to_ist(display['processed_at']).dt.floor('h')
     hourly = display.groupby(['hour_ist','final_label']).size().reset_index(name='count').sort_values('hour_ist').tail(72)
     
     if hourly.empty:
@@ -404,6 +408,25 @@ def update_live_charts(selected_mailbox, data_json):
     
     return fig_over, fig_today, fig_act
 
+# Populate client domain dropdown
+@app.callback(
+    Output('live-client-filter', 'options'),
+    Input('data-store', 'data'),
+    State('mailbox-selector', 'value')
+)
+def populate_client_filter(data_json, mailbox):
+    if not data_json:
+        return []
+    df = pd.read_json(data_json, orient='split')
+    if mailbox and mailbox != 'All Mailboxes':
+        df = df[df['mailbox']==mailbox]
+    
+    domains = sorted([d for d in df['client_domain'].unique() if d and d != "unknown"])
+    if "unknown" in df['client_domain'].unique():
+        domains.append("unknown")
+    
+    return [{'label': d, 'value': d} for d in domains]
+
 # Live feed table and quick filter handlers
 @app.callback(
     Output('live-feed-table', 'children'),
@@ -412,16 +435,21 @@ def update_live_charts(selected_mailbox, data_json):
     Input('table-btn-negative','n_clicks'),
     Input('table-btn-neutral','n_clicks'),
     Input('table-btn-positive','n_clicks'),
+    Input('live-client-filter', 'value'),
     Input('data-store','data'),
     State('mailbox-selector','value')
 )
-def update_live_table(n_all, n_neg, n_neu, n_pos, data_json, mailbox):
+def update_live_table(n_all, n_neg, n_neu, n_pos, client_domain, data_json, mailbox):
     ctx = dash.callback_context
     if not data_json:
         return html.Div(), ""
     df = pd.read_json(data_json, orient='split')
     if mailbox and mailbox != 'All Mailboxes':
         df = df[df['mailbox']==mailbox]
+    
+    # Filter by client domain
+    if client_domain:
+        df = df[df['client_domain']==client_domain]
     
     # determine which button triggered
     trig = None
@@ -436,9 +464,10 @@ def update_live_table(n_all, n_neg, n_neu, n_pos, data_json, mailbox):
     
     # prepare table
     if df.empty:
-        return html.Div(dbc.Alert("No emails to display", color="info")), "Showing 0 emails"
+        filter_msg = f" for client '{client_domain}'" if client_domain else ""
+        return html.Div(dbc.Alert(f"No emails to display{filter_msg}", color="info")), f"Showing 0 emails"
     
-    disp = df[['processed_at','received_dt','mailbox','sender','receivers','cc','subject','final_label','web_link']].copy()
+    disp = df[['processed_at','received_dt','mailbox','client_domain','sender','receivers','cc','subject','final_label','web_link']].copy()
     disp['processed_at'] = format_ist(disp['processed_at'])
     disp['received_dt'] = format_ist(disp['received_dt'])
     
@@ -451,6 +480,7 @@ def update_live_table(n_all, n_neg, n_neu, n_pos, data_json, mailbox):
             {"name":"Processed At","id":"processed_at"},
             {"name":"Received","id":"received_dt"},
             {"name":"Mailbox","id":"mailbox"},
+            {"name":"Client","id":"client_domain"},
             {"name":"Sender","id":"sender"},
             {"name":"To","id":"receivers"},
             {"name":"CC","id":"cc"},
