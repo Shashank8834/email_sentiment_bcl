@@ -1,11 +1,8 @@
 # dashboard/app.py
-# Dash conversion of your Streamlit app_dashboard.py
-
-# Add these imports at the top of app.py
+# Dash dashboard with PostgreSQL support - Full Features Restored
 
 import os
 from datetime import datetime, timedelta
-import sqlite3
 import io
 
 import pandas as pd
@@ -18,10 +15,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 
 from dotenv import load_dotenv
+from db_config import get_db_connection, init_connection_pool
+
 load_dotenv()
 
 # Config
-DB_PATH = os.environ.get("DB_PATH", "/data/monitor.db")
 AUTO_REFRESH_INTERVAL_SECONDS = 30
 
 # IST offset from UTC
@@ -29,66 +27,70 @@ IST_OFFSET = timedelta(hours=5, minutes=30)
 
 # Initialize app
 external_stylesheets = [dbc.themes.BOOTSTRAP]
-app = dash.Dash(__name__, external_stylesheets=external_stylesheets, suppress_callback_exceptions=True)
+app = dash.Dash(__name__, external_stylesheets=external_stylesheets, 
+                suppress_callback_exceptions=True)
 server = app.server
 app.title = "Email Sentiment Analytics"
 
+# Initialize database connection pool
+init_connection_pool(min_conn=2, max_conn=10)
+
 # ---------------- Data helpers ----------------
-def load_db(path=DB_PATH):
-    """Load processed table from sqlite and return a cleaned dataframe."""
+def load_db():
+    """Load processed table from PostgreSQL"""
     try:
-        conn = sqlite3.connect(path)
-        df = pd.read_sql_query("SELECT * FROM processed ORDER BY received_dt DESC", conn)
-        conn.close()
+        with get_db_connection() as conn:
+            query = """
+                SELECT message_id, mailbox, sender, receivers, cc, subject,
+                       final_label, prob_neg, web_link, sender_domain, 
+                       processed_at, received_dt
+                FROM processed 
+                ORDER BY received_dt DESC
+                LIMIT 10000
+            """
+            df = pd.read_sql_query(query, conn)
     except Exception as e:
-        raise RuntimeError(f"Failed to read DB at {path}: {e}")
-    if df is None or df.empty:
+        print(f"❌ Failed to read from PostgreSQL: {e}")
         return pd.DataFrame(columns=[
             "message_id", "mailbox", "sender", "receivers", "cc", "subject",
-            "final_label", "prob_neg", "web_link", "sender_domain", "processed_at", "received_dt"
+            "final_label", "prob_neg", "web_link", "sender_domain", 
+            "processed_at", "received_dt"
         ])
-    # Ensure required columns exist
-    required_cols = ["message_id", "mailbox", "sender", "receivers", "cc", "subject",
-                     "final_label", "prob_neg", "web_link", "sender_domain", "processed_at", "received_dt"]
-    for c in required_cols:
-        if c not in df.columns:
-            df[c] = ""
     
-    # Convert datetime strings to datetime objects (stored as UTC in DB)
+    if df.empty:
+        return df
+    
+    # Ensure datetime columns are parsed
     if 'processed_at' in df.columns:
         df['processed_at'] = pd.to_datetime(df['processed_at'], errors='coerce')
     if 'received_dt' in df.columns:
         df['received_dt'] = pd.to_datetime(df['received_dt'], errors='coerce')
     
+    # Extract client domain
     df["client_domain"] = df.get("sender_domain",
         df["sender"].apply(lambda s: (s or "").split("@")[-1].lower() if "@" in (s or "") else "")
     ).fillna("unknown").astype(str)
+    
     return df
 
 def to_ist(dt_series):
-    """Convert UTC datetime series to IST for display."""
+    """Convert UTC datetime series to IST for display"""
     if dt_series is None:
         return dt_series
-    # Add IST offset to UTC times
     return pd.to_datetime(dt_series) + IST_OFFSET
 
 def format_ist(dt_series, format_str='%Y-%m-%d %H:%M IST'):
-    """Format datetime series as IST string."""
+    """Format datetime series as IST string"""
     ist_times = to_ist(dt_series)
     return ist_times.dt.strftime(format_str)
 
 def get_current_ist():
-    """Get current time in IST."""
+    """Get current time in IST"""
     return datetime.utcnow() + IST_OFFSET
 
 def create_pie_chart(data, values, names, title):
     fig = px.pie(
-        data,
-        values=values,
-        names=names,
-        title=title,
-        hole=0.4,
-        color=names,
+        data, values=values, names=names, title=title, hole=0.4, color=names,
         color_discrete_map={'Negative': '#ff4444', 'Neutral': '#ffa500', 'Positive': '#00cc00'}
     )
     fig.update_traces(textposition='inside', textinfo='percent+label+value')
@@ -96,6 +98,7 @@ def create_pie_chart(data, values, names, title):
     return fig
 
 def create_timeline_chart(df, domain=None):
+    """Create timeline chart for trends analysis"""
     timeline_df = df.copy()
     if domain:
         timeline_df = timeline_df[timeline_df['client_domain'] == domain]
@@ -112,6 +115,7 @@ def create_timeline_chart(df, domain=None):
     return fig
 
 def create_domain_comparison_chart(df):
+    """Create domain comparison chart"""
     if df.empty:
         return go.Figure()
     domain_sentiment = df.groupby(['client_domain', 'final_label']).size().reset_index(name='count')
@@ -126,6 +130,7 @@ def create_domain_comparison_chart(df):
 # ---------------- Layout ----------------
 app.layout = dbc.Container([
     dcc.Store(id='data-store'),
+    dcc.Store(id='table-sentiment-filter', data='all'),
     dcc.Interval(id='auto-refresh', interval=AUTO_REFRESH_INTERVAL_SECONDS*1000, n_intervals=0),
     dcc.Location(id='url', refresh=False),
     dbc.Row([
@@ -153,20 +158,19 @@ app.layout = dbc.Container([
                     options=[{'label': '🔄 Auto-refresh', 'value': 'on'}],
                     value=[]
                 ),
-                dbc.Button("🔄 Refresh Now", id='btn-refresh', color='secondary', className='mt-2', n_clicks=0)
+                dbc.Button("🔄 Refresh Now", id='btn-refresh', color='secondary', 
+                          className='mt-2', n_clicks=0)
             ], className='mb-3'),
             html.Div(id='sidebar-stats', className='text-muted mt-3')
-        ], width=3, style={'borderRight': '1px solid #ddd', 'minHeight': '100vh', 'paddingTop': '1rem'}),
+        ], width=3, style={'borderRight': '1px solid #ddd', 'minHeight': '100vh', 
+                          'paddingTop': '1rem'}),
         dbc.Col([
             html.Div(id='page-content', style={'padding': '1rem'})
         ], width=9)
     ])
 ], fluid=True)
 
-
 # ---------------- Callbacks ----------------
-
-# Load data into store on refresh, interval, or manual click
 @app.callback(
     Output('data-store', 'data'),
     Input('btn-refresh', 'n_clicks'),
@@ -175,22 +179,18 @@ app.layout = dbc.Container([
     prevent_initial_call=False
 )
 def refresh_data(n_clicks, n_intervals, auto_vals):
-    # If auto-refresh is off, only refresh on manual click (btn-refresh)
     triggered = dash.callback_context.triggered
-    # If auto-refresh disabled and the trigger is interval, don't reload
     if triggered:
         trig_id = triggered[0]['prop_id']
         if 'auto-refresh' in trig_id and (not auto_vals or 'on' not in auto_vals):
             raise dash.exceptions.PreventUpdate
     try:
-        df = load_db(DB_PATH)
+        df = load_db()
         return df.to_json(date_format='iso', orient='split')
     except Exception as e:
-        print(f"Error loading data: {e}")
-        # store an empty DataFrame with error flag
+        print(f"❌ Error loading data: {e}")
         return pd.DataFrame().to_json(date_format='iso', orient='split')
 
-# Sidebar stats
 @app.callback(
     Output('sidebar-stats', 'children'),
     Input('data-store', 'data')
@@ -214,7 +214,6 @@ def update_sidebar_stats(data_json):
         html.Div(f"Last processed: {last_str}")
     ])
 
-# Render selected page
 @app.callback(
     Output('page-content', 'children'),
     Input('page-selector', 'value'),
@@ -222,7 +221,7 @@ def update_sidebar_stats(data_json):
 )
 def render_page(page, data_json):
     if not data_json:
-        return dbc.Alert("No data — check the monitor and DB file.", color="warning")
+        return dbc.Alert("No data – check the monitor and database.", color="warning")
     df = pd.read_json(data_json, orient='split')
     if df.empty:
         return dbc.Alert("No data available. Start the monitor to collect emails.", color="info")
@@ -237,6 +236,11 @@ def render_page(page, data_json):
 # ---------- Page builders ----------
 def live_page_layout(df_all):
     mailboxes = ["All Mailboxes"] + sorted(df_all['mailbox'].dropna().unique().tolist())
+    
+    # Get domains for the domain view selector
+    domain_counts = df_all['client_domain'].value_counts().reset_index()
+    domain_counts.columns = ['client_domain', 'email_count']
+    
     layout = html.Div([
         html.H3("📊 Live Sentiment Analysis"),
         dbc.Row([
@@ -255,25 +259,53 @@ def live_page_layout(df_all):
             dbc.Col(dcc.Graph(id='activity-chart'), width=4)
         ]),
         html.Hr(),
-        html.H4("🔴 Live Feed - All Emails"),
-        html.Div(id='sentiment-filter-info'),
-        dbc.Row([
-            dbc.Col(dbc.ButtonGroup([
-                dbc.Button("📊 Show All", id='table-btn-all', color='secondary', size='sm'),
-                dbc.Button("🔴 Negative Only", id='table-btn-negative', color='danger', size='sm'),
-                dbc.Button("🟡 Neutral Only", id='table-btn-neutral', color='warning', size='sm'),
-                dbc.Button("🟢 Positive Only", id='table-btn-positive', color='success', size='sm')
-            ]), width=6),
-            dbc.Col([
-                html.Label("Filter by Client Domain", className='me-2'),
-                dcc.Dropdown(id='live-client-filter', placeholder='Select client domain...', clearable=True)
-            ], width=6)
-        ], className='mb-2'),
-        html.Div(id='email-count-display', className='mb-2'),
-        html.Div(id='live-feed-table'),
-        dbc.Button("📥 Download CSV", id='download-btn', color='primary', className='mt-3'),
-        dcc.Download(id='download-dataframe-csv')
+        
+        # NEW TABS SECTION - positioned above the live feed
+        dcc.Tabs(id='live-page-tabs', value='domain-view', children=[
+            dcc.Tab(label='👥 Domain View', value='domain-view', children=[
+                html.Div([
+                    html.H4("Filter by Client Domain"),
+                    dbc.Row([
+                        dbc.Col([
+                            html.Label("Select Domain"),
+                            dcc.Dropdown(
+                                id='domain-view-selector',
+                                options=[{'label': f"{row['client_domain']} ({row['email_count']} emails)", 'value': row['client_domain']} 
+                                        for _, row in domain_counts.iterrows()],
+                                placeholder='Select a domain to filter emails...',
+                                clearable=True
+                            )
+                        ], width=6)
+                    ], className='mb-3'),
+                    html.Div(id='domain-view-count-display', className='mb-2'),
+                    html.Div(id='domain-view-table')
+                ], style={'padding': '1rem'})
+            ]),
+            dcc.Tab(label='🔴 Live Feed', value='live-feed', children=[
+                html.Div([
+                    html.H4("🔴 Live Feed - All Emails"),
+                    html.Div(id='sentiment-filter-info'),
+                    dbc.Row([
+                        dbc.Col(dbc.ButtonGroup([
+                            dbc.Button("📊 Show All", id='table-btn-all', color='secondary', size='sm'),
+                            dbc.Button("🔴 Negative Only", id='table-btn-negative', color='danger', size='sm'),
+                            dbc.Button("🟡 Neutral Only", id='table-btn-neutral', color='warning', size='sm'),
+                            dbc.Button("🟢 Positive Only", id='table-btn-positive', color='success', size='sm')
+                        ]), width=6),
+                        dbc.Col([
+                            html.Label("Filter by Client Domain", className='me-2'),
+                            dcc.Dropdown(id='live-client-filter', placeholder='Select client domain...', clearable=True)
+                        ], width=6)
+                    ], className='mb-2'),
+                    html.Div(id='email-count-display', className='mb-2'),
+                    html.Div(id='live-feed-table'),
+                    dbc.Button("📥 Download CSV", id='download-btn', color='primary', className='mt-3'),
+                    dcc.Download(id='download-dataframe-csv')
+                ], style={'padding': '1rem'})
+            ])
+        ])
     ])
+    
     return layout
 
 def trends_layout(df):
@@ -353,6 +385,7 @@ def update_metrics(selected_mailbox, data_json):
     neu = (df['final_label']=='Neutral').sum()
     pos = (df['final_label']=='Positive').sum()
     avg_neg = df['prob_neg'].replace("",0).astype(float).mean() if total>0 else 0.0
+    
     row = dbc.Row([
         dbc.Col(dbc.Card(dbc.CardBody([html.H6("📧 Total Emails"), html.H4(f"{total:,}")]))),
         dbc.Col(dbc.Card(dbc.CardBody([html.H6("🔴 Negative"), html.H4(f"{neg:,}"), html.Div(f"{(neg/total*100):.1f}%" if total>0 else "0%")]))),
@@ -408,13 +441,45 @@ def update_live_charts(selected_mailbox, data_json):
     
     return fig_over, fig_today, fig_act
 
-# Populate client domain dropdown
+# Sentiment filter button callbacks
+@app.callback(
+    Output('table-sentiment-filter', 'data'),
+    Output('sentiment-filter-info', 'children'),
+    Input('table-btn-all', 'n_clicks'),
+    Input('table-btn-negative', 'n_clicks'),
+    Input('table-btn-neutral', 'n_clicks'),
+    Input('table-btn-positive', 'n_clicks')
+)
+def update_sentiment_filter(all_clicks, neg_clicks, neu_clicks, pos_clicks):
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        return 'all', ""
+    
+    button_id = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    info_messages = {
+        'table-btn-all': "📊 Showing all emails",
+        'table-btn-negative': "🔴 Showing only negative emails",
+        'table-btn-neutral': "🟡 Showing only neutral emails",
+        'table-btn-positive': "🟢 Showing only positive emails"
+    }
+    
+    filter_map = {
+        'table-btn-all': 'all',
+        'table-btn-negative': 'Negative',
+        'table-btn-neutral': 'Neutral',
+        'table-btn-positive': 'Positive'
+    }
+    
+    return filter_map.get(button_id, 'all'), info_messages.get(button_id, "")
+
+# Populate client domain filter
 @app.callback(
     Output('live-client-filter', 'options'),
     Input('data-store', 'data'),
     State('mailbox-selector', 'value')
 )
-def populate_client_filter(data_json, mailbox):
+def populate_live_client_filter(data_json, mailbox):
     if not data_json:
         return []
     df = pd.read_json(data_json, orient='split')
@@ -422,75 +487,183 @@ def populate_client_filter(data_json, mailbox):
         df = df[df['mailbox']==mailbox]
     
     domains = sorted([d for d in df['client_domain'].unique() if d and d != "unknown"])
-    if "unknown" in df['client_domain'].unique():
+    if "unknown" in df['client_domain'].values:
         domains.append("unknown")
     
     return [{'label': d, 'value': d} for d in domains]
 
-# Live feed table and quick filter handlers
+# Update live feed table
 @app.callback(
     Output('live-feed-table', 'children'),
     Output('email-count-display', 'children'),
-    Input('table-btn-all','n_clicks'),
-    Input('table-btn-negative','n_clicks'),
-    Input('table-btn-neutral','n_clicks'),
-    Input('table-btn-positive','n_clicks'),
-    Input('live-client-filter', 'value'),
     Input('data-store','data'),
+    Input('table-sentiment-filter', 'data'),
+    Input('live-client-filter', 'value'),
     State('mailbox-selector','value')
 )
-def update_live_table(n_all, n_neg, n_neu, n_pos, client_domain, data_json, mailbox):
-    ctx = dash.callback_context
+def update_live_table(data_json, sentiment_filter, client_filter, mailbox):
     if not data_json:
         return html.Div(), ""
+    
     df = pd.read_json(data_json, orient='split')
     if mailbox and mailbox != 'All Mailboxes':
         df = df[df['mailbox']==mailbox]
     
-    # Filter by client domain
-    if client_domain:
-        df = df[df['client_domain']==client_domain]
+    # Apply sentiment filter
+    if sentiment_filter != 'all':
+        df = df[df['final_label'] == sentiment_filter]
     
-    # determine which button triggered
-    trig = None
-    if ctx.triggered:
-        trig = ctx.triggered[0]['prop_id'].split('.')[0]
-    if trig == 'table-btn-negative':
-        df = df[df['final_label']=='Negative']
-    elif trig == 'table-btn-neutral':
-        df = df[df['final_label']=='Neutral']
-    elif trig == 'table-btn-positive':
-        df = df[df['final_label']=='Positive']
+    # Apply client domain filter
+    if client_filter:
+        df = df[df['client_domain'] == client_filter]
     
-    # prepare table
     if df.empty:
-        filter_msg = f" for client '{client_domain}'" if client_domain else ""
-        return html.Div(dbc.Alert(f"No emails to display{filter_msg}", color="info")), f"Showing 0 emails"
+        return dbc.Alert("No emails match the selected filters", color="info"), "Showing 0 emails"
     
-    disp = df[['processed_at','received_dt','mailbox','client_domain','sender','receivers','cc','subject','final_label','web_link']].copy()
+    # Prepare display
+    disp = df[['processed_at', 'received_dt', 'mailbox', 'client_domain', 'sender', 
+               'receivers', 'cc', 'subject', 'final_label', 'web_link']].head(50).copy()
     disp['processed_at'] = format_ist(disp['processed_at'])
     disp['received_dt'] = format_ist(disp['received_dt'])
     
-    # create clickable subject column
-    disp['subject_html'] = disp.apply(lambda r: f"[{r['subject']}]({r['web_link']})" if pd.notna(r['web_link']) and str(r['web_link']).strip() else r['subject'], axis=1)
+    # Create clickable subject column
+    disp['subject_html'] = disp.apply(
+        lambda r: f"[{r['subject']}]({r['web_link']})" if pd.notna(r['web_link']) and str(r['web_link']).strip() else r['subject'], 
+        axis=1
+    )
     
     table = dash_table.DataTable(
-        id='live-table',
+        id='live-feed-data-table',
         columns=[
-            {"name":"Processed At","id":"processed_at"},
-            {"name":"Received","id":"received_dt"},
-            {"name":"Mailbox","id":"mailbox"},
-            {"name":"Client","id":"client_domain"},
-            {"name":"Sender","id":"sender"},
-            {"name":"To","id":"receivers"},
-            {"name":"CC","id":"cc"},
-            {"name":"Subject","id":"subject_html","presentation":"markdown"},
-            {"name":"Sentiment","id":"final_label"}
+            {"name": "Processed", "id": "processed_at"},
+            {"name": "Received", "id": "received_dt"},
+            {"name": "Mailbox", "id": "mailbox"},
+            {"name": "Client", "id": "client_domain"},
+            {"name": "Sender", "id": "sender"},
+            {"name": "To", "id": "receivers"},
+            {"name": "CC", "id": "cc"},
+            {"name": "Subject", "id": "subject_html", "presentation": "markdown"},
+            {"name": "Sentiment", "id": "final_label"}
         ],
         data=disp.to_dict('records'),
         page_size=12,
-        style_table={'overflowX':'auto'},
-        style_cell={'textAlign':'left','padding':'6px'},
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'left', 'padding': '6px'},
+        style_data_conditional=[
+            {'if': {'filter_query': '{final_label} = "Negative"'}, 
+             'backgroundColor': '#fff0f0'}
+        ]
+    )
+    
+    return table, f"Showing {len(disp)} emails"
+
+# Download CSV callback
+@app.callback(
+    Output('download-dataframe-csv', 'data'),
+    Input('download-btn', 'n_clicks'),
+    State('data-store', 'data'),
+    State('mailbox-selector', 'value'),
+    State('table-sentiment-filter', 'data'),
+    State('live-client-filter', 'value'),
+    prevent_initial_call=True
+)
+def download_csv(n_clicks, data_json, mailbox, sentiment_filter, client_filter):
+    if not data_json or n_clicks == 0:
+        raise dash.exceptions.PreventUpdate
+    
+    df = pd.read_json(data_json, orient='split')
+    if mailbox and mailbox != 'All Mailboxes':
+        df = df[df['mailbox'] == mailbox]
+    
+    if sentiment_filter != 'all':
+        df = df[df['final_label'] == sentiment_filter]
+    
+    if client_filter:
+        df = df[df['client_domain'] == client_filter]
+    
+    # Prepare CSV export
+    export_df = df.copy()
+    export_df['processed_at_ist'] = format_ist(export_df['processed_at'])
+    export_df['received_dt_ist'] = format_ist(export_df['received_dt'])
+    
+    csv_columns = ['processed_at_ist', 'received_dt_ist', 'mailbox', 'client_domain', 
+                   'sender', 'receivers', 'cc', 'subject', 'final_label', 'prob_neg']
+    
+    return dcc.send_data_frame(export_df[csv_columns].to_csv, "email_sentiment_export.csv")
+
+# NEW CALLBACK: Populate domain view selector
+@app.callback(
+    Output('domain-view-selector', 'options'),
+    Input('data-store', 'data'),
+    State('mailbox-selector', 'value')
+)
+def populate_domain_view_selector(data_json, mailbox):
+    """Populate domain selector with email counts for Domain View tab."""
+    if not data_json:
+        return []
+    df = pd.read_json(data_json, orient='split')
+    if mailbox and mailbox != 'All Mailboxes':
+        df = df[df['mailbox'] == mailbox]
+    
+    domain_counts = df['client_domain'].value_counts().reset_index()
+    domain_counts.columns = ['client_domain', 'email_count']
+    
+    return [{'label': f"{row['client_domain']} ({row['email_count']} emails)", 'value': row['client_domain']} 
+            for _, row in domain_counts.iterrows()]
+
+# NEW CALLBACK: Update domain view table
+@app.callback(
+    Output('domain-view-table', 'children'),
+    Output('domain-view-count-display', 'children'),
+    Input('domain-view-selector', 'value'),
+    Input('data-store', 'data'),
+    State('mailbox-selector', 'value')
+)
+def update_domain_view_table(selected_domain, data_json, mailbox):
+    """Update table in Domain View tab based on selected domain."""
+    if not data_json:
+        return html.Div(), ""
+    
+    df = pd.read_json(data_json, orient='split')
+    if mailbox and mailbox != 'All Mailboxes':
+        df = df[df['mailbox'] == mailbox]
+    
+    if not selected_domain:
+        return html.Div(dbc.Alert("Select a domain to view emails", color="info")), ""
+    
+    # Filter by selected domain
+    filtered_df = df[df['client_domain'] == selected_domain]
+    
+    if filtered_df.empty:
+        return html.Div(dbc.Alert(f"No emails found for domain: {selected_domain}", color="warning")), f"Showing 0 emails for {selected_domain}"
+    
+    # Prepare display
+    disp = filtered_df[['processed_at', 'received_dt', 'mailbox', 'sender', 'receivers', 'cc', 'subject', 'final_label', 'web_link']].copy()
+    disp['processed_at'] = format_ist(disp['processed_at'])
+    disp['received_dt'] = format_ist(disp['received_dt'])
+    
+    # Create clickable subject column
+    disp['subject_html'] = disp.apply(
+        lambda r: f"[{r['subject']}]({r['web_link']})" if pd.notna(r['web_link']) and str(r['web_link']).strip() else r['subject'], 
+        axis=1
+    )
+    
+    table = dash_table.DataTable(
+        id='domain-view-data-table',
+        columns=[
+            {"name": "Processed At", "id": "processed_at"},
+            {"name": "Received", "id": "received_dt"},
+            {"name": "Mailbox", "id": "mailbox"},
+            {"name": "Sender", "id": "sender"},
+            {"name": "To", "id": "receivers"},
+            {"name": "CC", "id": "cc"},
+            {"name": "Subject", "id": "subject_html", "presentation": "markdown"},
+            {"name": "Sentiment", "id": "final_label"}
+        ],
+        data=disp.to_dict('records'),
+        page_size=15,
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'left', 'padding': '6px'},
         style_data_conditional=[
             {
                 'if': {'filter_query': '{final_label} = "Negative"'},
@@ -498,25 +671,8 @@ def update_live_table(n_all, n_neg, n_neu, n_pos, client_domain, data_json, mail
             }
         ]
     )
-    return table, f"Showing {len(disp)} emails"
-
-# CSV download from live table
-@app.callback(
-    Output('download-dataframe-csv', 'data'),
-    Input('download-btn', 'n_clicks'),
-    State('data-store', 'data'),
-    State('mailbox-selector','value'),
-    prevent_initial_call=True
-)
-def download_csv(n_clicks, data_json, mailbox):
-    if not data_json:
-        raise dash.exceptions.PreventUpdate
-    df = pd.read_json(data_json, orient='split')
-    if mailbox and mailbox!='All Mailboxes':
-        df = df[df['mailbox']==mailbox]
-    csv_string = df.to_csv(index=False)
-    timestamp = get_current_ist().strftime('%Y%m%d_%H%M%S')
-    return dcc.send_bytes(csv_string.encode('utf-8'), filename=f"emails_{mailbox}_{timestamp}.csv")
+    
+    return table, f"Showing {len(disp)} emails for domain: {selected_domain}"
 
 # ---------- Trends callbacks ----------
 @app.callback(
@@ -621,8 +777,8 @@ def email_details(sentiments, mailbox, search, data_json):
     if search and search.strip():
         q = search.lower()
         detail_df = detail_df[detail_df['subject'].fillna('').str.lower().str.contains(q) |
-                               detail_df['sender'].fillna('').str.lower().str.contains(q) |
-                               detail_df['receivers'].fillna('').str.lower().str.contains(q)]
+                              detail_df['sender'].fillna('').str.lower().str.contains(q) |
+                              detail_df['receivers'].fillna('').str.lower().str.contains(q)]
     
     if detail_df.empty:
         return dbc.Alert("No emails match the current filters", color='info')
@@ -670,8 +826,25 @@ def download_details(n, csv_str):
     timestamp = get_current_ist().strftime('%Y%m%d_%H%M%S')
     return dcc.send_bytes(csv_str.encode('utf-8'), filename=f"email_sentiment_{timestamp}.csv")
 
-# Run app
+# Add healthcheck endpoint for Docker
+from flask import Flask
+health_app = Flask(__name__)
+
+@health_app.route("/_health")
+def health():
+    return "OK", 200
+
+# Mount healthcheck on main Flask server
+@app.server.route("/_health")
+def dash_health():
+    return "OK", 200
+
+
 if __name__ == '__main__':
-    # default port 8050; change via env if needed
     port = int(os.environ.get("PORT", 8050))
+    # Add healthcheck endpoint
+    @app.server.route("/_health")
+    def healthcheck():
+     return "OK", 200
+
     app.run(debug=False, host='0.0.0.0', port=port)

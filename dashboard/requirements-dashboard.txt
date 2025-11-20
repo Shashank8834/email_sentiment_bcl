@@ -8,3 +8,5 @@ dash
 dash-bootstrap-components
 gunicorn
 pytz
+psycopg2-binary
+sqlalchemy

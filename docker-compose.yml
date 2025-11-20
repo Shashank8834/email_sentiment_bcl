@@ -1,6 +1,25 @@
 ﻿version: "3.8"
 
 services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: email_postgres
+    environment:
+      POSTGRES_DB: email_monitor
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-strongpassword}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - email-monitor-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   monitor:
     build:
       context: ./monitor
@@ -10,6 +29,9 @@ services:
       - ./data:/data
       - ./monitor:/app
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - email-monitor-network
 
@@ -18,13 +40,17 @@ services:
       context: ./dashboard
     container_name: email_dashboard
     env_file: .env
-    command: ["python", "app.py"]
+    environment:
+      - PORT=8050
     ports:
       - "8050:8050"
     volumes:
       - ./data:/data
       - ./dashboard:/app
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - email-monitor-network
 
@@ -33,16 +59,24 @@ services:
       context: ./dashboard
     container_name: email_admin_dashboard
     env_file: .env
-    command: ["python", "admin.py"]
+    environment:
+      - PORT=8051
     ports:
       - "8051:8051"
     volumes:
       - ./data:/data
       - ./dashboard:/app
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - email-monitor-network
 
 networks:
   email-monitor-network:
     driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local

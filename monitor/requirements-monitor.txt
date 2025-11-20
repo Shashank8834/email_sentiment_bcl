@@ -2,3 +2,5 @@
 requests
 transformers
 numpy
+psycopg2-binary
+sqlalchemy
