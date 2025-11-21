@@ -53,3 +53,5 @@ backups/
 tmp/
 temp/
 *.tmp
+
+email sentiment.txt
