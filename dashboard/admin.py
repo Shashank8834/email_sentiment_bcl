@@ -1,9 +1,10 @@
-# admin.py
+# admin.py - Updated admin console with fixed caution words functions and safer callbacks
 # Admin/Backend dashboard for system configuration and monitoring - PostgreSQL version
 
 import os
 from datetime import datetime, timedelta
 import io
+import re
 
 import dash
 from dash import dcc, html, Input, Output, State, dash_table
@@ -14,7 +15,7 @@ import pandas as pd
 
 from dotenv import load_dotenv
 
-# Import PostgreSQL config
+# Import PostgreSQL config (your existing db_config)
 from db_config import get_db_connection, init_connection_pool
 
 load_dotenv()
@@ -22,8 +23,11 @@ load_dotenv()
 # Configuration
 PORT = int(os.environ.get("PORT", 8051))  # admin dashboard default port
 
-# Initialize database connection pool
-init_connection_pool(min_conn=2, max_conn=10)
+# Initialize database connection pool (no-op if implemented)
+try:
+    init_connection_pool(min_conn=2, max_conn=10)
+except Exception:
+    pass
 
 # Initialize Dash app
 app = dash.Dash(
@@ -35,8 +39,181 @@ app = dash.Dash(
 app.title = "Email Monitor - Admin Console"
 server = app.server  # For compatibility
 
-# Database functions
-# In admin.py, replace the load_db function with this:
+# -----------------------
+# New DB helpers for admin_settings & caution_words
+# -----------------------
+def ensure_admin_tables():
+    """Create admin_settings and caution_words tables if they don't exist and seed defaults."""
+    SQL = """
+    CREATE TABLE IF NOT EXISTS caution_words (
+      id SERIAL PRIMARY KEY,
+      word TEXT NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
+
+    INSERT INTO admin_settings (key, value)
+      VALUES ('neg_prob_thresh', '0.06')
+    ON CONFLICT DO NOTHING;
+
+    INSERT INTO admin_settings (key, value)
+      VALUES ('poll_interval', '30'),
+             ('max_emails_per_poll', '50'),
+             ('auto_refresh_interval', '30')
+    ON CONFLICT DO NOTHING;
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(SQL)
+            conn.commit()
+    except Exception as e:
+        print("ensure_admin_tables error:", e)
+
+
+def fetch_settings_from_db():
+    """Return dict of key->value from admin_settings."""
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql_query("SELECT key, value FROM admin_settings", conn)
+            return {k: v for k, v in zip(df['key'], df['value'])}
+    except Exception as e:
+        print("fetch_settings_from_db error:", e)
+        return {}
+
+
+def set_setting(key: str, value: str) -> bool:
+    """Upsert a setting into admin_settings."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO admin_settings (key, value, updated_at)
+                    VALUES (%s, %s, now())
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+                """, (key, str(value)))
+                conn.commit()
+                return True
+    except Exception as e:
+        print("set_setting error:", e)
+        return False
+
+
+# --- Caution words helpers (fixed, improved) ---
+
+def add_caution_word(word: str):
+    """
+    Insert a caution word (normalized to lower). Returns (ok, msg).
+    FIXED: Better validation and error messages
+    """
+    if not word or not str(word).strip():
+        return False, "empty"
+    
+    # Normalize to lowercase and trim
+    w = str(word).strip().lower()
+    
+    # Validate word is not just spaces or special chars
+    if len(w) < 2:
+        return False, "Word must be at least 2 characters"
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                # Check if exists first
+                cur.execute("SELECT id FROM caution_words WHERE word = %s", (w,))
+                if cur.fetchone():
+                    return False, "exists"
+                
+                # Insert new word
+                cur.execute(
+                    "INSERT INTO caution_words (word, created_at) VALUES (%s, now()) RETURNING id", 
+                    (w,)
+                )
+                word_id = cur.fetchone()
+                conn.commit()
+                
+                if word_id:
+                    print(f"✅ Added caution word: '{w}' (id={word_id[0]})")
+                    return True, "added"
+                else:
+                    return False, "insert_failed"
+                    
+    except Exception as e:
+        print(f"❌ add_caution_word error: {e}")
+        return False, str(e)
+
+
+def get_caution_words():
+    """
+    Return list of dicts: {id, word, created_at} ordered newest first.
+    FIXED: Better error handling and logging
+    """
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql_query(
+                "SELECT id, word, created_at FROM caution_words ORDER BY created_at DESC", 
+                conn
+            )
+            
+            if df.empty:
+                print("⚠️ No caution words in database")
+                return []
+            
+            print(f"✅ Retrieved {len(df)} caution words from database")
+            return df.to_dict("records")
+            
+    except Exception as e:
+        print(f"❌ get_caution_words error: {e}")
+        return []
+
+
+def fetch_caution_words_from_db():
+    """
+    Return list[str] of caution words ordered newest-first.
+    FIXED: Ensures lowercase normalization
+    """
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql_query(
+                "SELECT word FROM caution_words ORDER BY created_at DESC", 
+                conn
+            )
+            
+            if df.empty:
+                print("⚠️ No caution words found, using defaults")
+                return []
+            
+            # Ensure lowercase and clean
+            words = [str(w).strip().lower() for w in df['word'].tolist() if w and str(w).strip()]
+            print(f"✅ Loaded {len(words)} caution keywords: {words[:5]}...")
+            return words
+            
+    except Exception as e:
+        print(f"❌ fetch_caution_words_from_db error: {e}")
+        return []
+
+
+def remove_caution_word(word_id: int) -> bool:
+    """Delete caution word by id."""
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM caution_words WHERE id = %s", (int(word_id),))
+                conn.commit()
+                return cur.rowcount > 0
+    except Exception as e:
+        print("remove_caution_word error:", e)
+        return False
+
+
+# -----------------------
+# Existing DB / app code
+# -----------------------
 
 def load_db(max_rows=5000):
     """Load data from PostgreSQL database"""
@@ -51,6 +228,7 @@ def load_db(max_rows=5000):
                 LIMIT %s
             """
             df = pd.read_sql_query(query, conn, params=(max_rows,))
+            print(f"✅ load_db: Retrieved {len(df)} rows from database")
     except Exception as e:
         print(f"❌ Failed to read from PostgreSQL: {e}")
         return pd.DataFrame(columns=[
@@ -72,6 +250,7 @@ def load_db(max_rows=5000):
         ).fillna("unknown").astype(str)
     
     return df
+
 
 def get_db_stats():
     """Get database statistics from PostgreSQL"""
@@ -152,7 +331,20 @@ navbar = dbc.Navbar(
     className="mb-4"
 )
 
-# Settings panel
+# Settings panel (now reads initial values from DB)
+_initial_settings = fetch_settings_from_db()
+_max_rows_init = 5000
+_neg_init = 0.06
+if _initial_settings:
+    try:
+        _max_rows_init = int(_initial_settings.get('max_rows', _initial_settings.get('max_emails_per_poll', 5000)))
+    except Exception:
+        _max_rows_init = 5000
+    try:
+        _neg_init = float(_initial_settings.get('neg_prob_thresh', 0.06))
+    except Exception:
+        _neg_init = 0.06
+
 settings_panel = dbc.Card([
     dbc.CardHeader("⚙️ System Settings"),
     dbc.CardBody([
@@ -160,7 +352,7 @@ settings_panel = dbc.Card([
         dcc.Input(
             id='max-rows-input',
             type='number',
-            value=5000,
+            value=_max_rows_init,
             min=100,
             step=500,
             className="form-control mb-3"
@@ -171,7 +363,7 @@ settings_panel = dbc.Card([
             min=0,
             max=1,
             step=0.01,
-            value=0.06,
+            value=_neg_init,
             marks={0: '0', 0.25: '0.25', 0.5: '0.5', 0.75: '0.75', 1: '1'},
             tooltip={"placement": "bottom", "always_visible": True}
         ),
@@ -186,7 +378,10 @@ settings_panel = dbc.Card([
             ],
             value=['system'],
             switch=True
-        )
+        ),
+        html.Br(),
+        dbc.Button("Save Settings", id="admin-save-settings", color="primary", className="mt-2"),
+        html.Div(id='settings-save-feedback', className="mt-2")  # NEW: feedback div
     ])
 ], className="mb-4")
 
@@ -194,7 +389,7 @@ settings_panel = dbc.Card([
 app.layout = html.Div([
     navbar,
     dcc.Store(id='admin-data-store'),
-    dcc.Store(id='settings-store', data={'max_rows': 5000, 'neg_threshold': 0.06}),
+    dcc.Store(id='settings-store', data={'max_rows': _max_rows_init, 'neg_threshold': _neg_init}),
     dcc.Interval(
         id='admin-interval',
         interval=30*1000,
@@ -210,6 +405,7 @@ app.layout = html.Div([
                     dbc.Tab(label="🗄️ Database Management", tab_id="database"),
                     dbc.Tab(label="⚡ Performance Metrics", tab_id="performance"),
                     dbc.Tab(label="🔧 Configuration", tab_id="config"),
+                    dbc.Tab(label="🛡️ Cautionary Words", tab_id="caution"),
                 ], id="admin-tabs", active_tab="overview"),
                 html.Div(id='admin-tab-content', className="mt-4")
             ], width=9)
@@ -220,13 +416,10 @@ app.layout = html.Div([
         dbc.Row([
             dbc.Col([
                 html.Small(id='last-updated-time', className="text-muted")
-            ], width=4),
+            ], width=6),
             dbc.Col([
                 html.Small(id='loaded-records-info', className="text-muted")
-            ], width=4),
-            dbc.Col([
-                html.Small(f"💾 Database: PostgreSQL", className="text-muted")
-            ], width=4)
+            ], width=6)
         ])
     ], fluid=True, className="mb-3")
 ])
@@ -242,12 +435,24 @@ def load_admin_data(n_clicks, max_rows, n_intervals):
     """Load data from database"""
     try:
         df = load_db(max_rows or 5000)
+        if df.empty:
+            print("⚠️ load_admin_data: DataFrame is empty")
+        else:
+            print(f"✅ load_admin_data: Loaded {len(df)} rows")
         return df.to_json(date_format='iso', orient='split')
     except Exception as e:
         print(f"❌ Error loading data: {e}")
-        return None
+        import traceback
+        traceback.print_exc()
+        # Return valid empty DataFrame JSON instead of None
+        empty_df = pd.DataFrame(columns=[
+            "message_id", "mailbox", "sender", "receivers", "cc", "subject",
+            "final_label", "prob_neg", "web_link", "sender_domain",
+            "processed_at", "received_dt"
+        ])
+        return empty_df.to_json(date_format='iso', orient='split')
 
-# Update settings store
+# Update settings store (UI local)
 @app.callback(
     Output('settings-store', 'data'),
     [Input('max-rows-input', 'value'),
@@ -256,7 +461,24 @@ def load_admin_data(n_clicks, max_rows, n_intervals):
 def update_settings(max_rows, neg_threshold):
     return {'max_rows': max_rows, 'neg_threshold': neg_threshold}
 
-# Update footer
+# Save settings to DB - FIXED: uses different output
+@app.callback(
+    Output('settings-save-feedback', 'children'),
+    Input('admin-save-settings', 'n_clicks'),
+    State('max-rows-input', 'value'),
+    State('neg-threshold-slider', 'value'),
+    prevent_initial_call=True
+)
+def save_settings_to_db(n_clicks, max_rows, neg_threshold):
+    saved1 = set_setting('max_rows', str(max_rows))
+    saved2 = set_setting('neg_prob_thresh', str(neg_threshold))
+    saved3 = set_setting('max_emails_per_poll', str(max_rows))
+    if saved1 and saved2:
+        return dbc.Alert(f"✅ Settings saved at {get_current_ist().strftime('%H:%M:%S IST')}", color="success", duration=4000)
+    else:
+        return dbc.Alert("❌ Failed to save settings", color="danger")
+
+# Update footer - FIXED: single callback for footer
 @app.callback(
     [Output('last-updated-time', 'children'),
      Output('loaded-records-info', 'children')],
@@ -264,14 +486,17 @@ def update_settings(max_rows, neg_threshold):
 )
 def update_footer(data_json):
     if data_json:
-        df = pd.read_json(data_json, orient='split')
-        return (
-            f"🕐 Last updated: {get_current_ist().strftime('%Y-%m-%d %H:%M:%S IST')}",
-            f"📊 Loaded records: {len(df):,}"
-        )
+        try:
+            df = pd.read_json(data_json, orient='split')
+            return (
+                f"🕐 Last updated: {get_current_ist().strftime('%Y-%m-%d %H:%M:%S IST')}",
+                f"📊 Loaded records: {len(df):,}"
+            )
+        except Exception as e:
+            print(f"update_footer error: {e}")
     return "🕐 No data", "📊 No records"
 
-# Render tab content
+# Render tab content - FIXED: better error handling
 @app.callback(
     Output('admin-tab-content', 'children'),
     [Input('admin-tabs', 'active_tab'),
@@ -279,11 +504,37 @@ def update_footer(data_json):
      Input('display-options', 'value')]
 )
 def render_tab_content(active_tab, data_json, display_options):
+    print(f"🔍 render_tab_content: tab={active_tab}, data_json type={type(data_json)}")
+    
+    # Handle display_options being None
+    if display_options is None:
+        display_options = []
+    
+    # Guard against None / empty store content
     if data_json is None:
-        return dbc.Alert("Error loading data. Please check database connection.", color="danger")
-    df = pd.read_json(data_json, orient='split')
+        print("⚠️ data_json is None")
+        return dbc.Alert("Loading data... Please wait or click Refresh.", color="info")
+    
+    if not data_json or str(data_json).strip() in ('', 'null', 'None'):
+        print("⚠️ data_json is empty/null string")
+        return dbc.Alert("No data in store. Click Refresh to load.", color="warning")
+    
+    try:
+        df = pd.read_json(data_json, orient='split')
+        print(f"✅ Parsed DataFrame: {len(df)} rows")
+    except Exception as e:
+        print(f"❌ Failed to parse data_json: {e}")
+        return dbc.Alert(f"Error parsing data: {str(e)}. Please refresh.", color="danger")
+
     if df.empty:
-        return dbc.Alert("No data available. Start the monitor to collect emails.", color="info")
+        # Still allow access to config and caution tabs even with no data
+        if active_tab == 'config':
+            return create_config_tab(display_options)
+        elif active_tab == 'caution':
+            return create_caution_tab_ui()
+        return dbc.Alert("No data available. Start the monitor to collect emails, or check database connection.", color="info")
+    
+    # Render appropriate tab
     if active_tab == 'overview':
         return create_overview_tab(df)
     elif active_tab == 'database':
@@ -292,8 +543,13 @@ def render_tab_content(active_tab, data_json, display_options):
         return create_performance_tab(df)
     elif active_tab == 'config':
         return create_config_tab(display_options)
+    elif active_tab == 'caution':
+        return create_caution_tab_ui()
+    
     return html.Div("Select a tab")
 
+# --------------------------
+# Content creators
 def create_overview_tab(df):
     """Create System Overview tab"""
     stats = get_db_stats()
@@ -451,6 +707,7 @@ def create_overview_tab(df):
         ])
     ])
 
+
 def create_database_tab(df, display_options):
     """Create Database Management tab"""
     stats = get_db_stats()
@@ -470,17 +727,7 @@ def create_database_tab(df, display_options):
     if not quality_alerts:
         quality_alerts.append(dbc.Alert("✅ No data quality issues detected", color="success"))
     
-    # Database info - no file size for PostgreSQL, show connection info instead
-    db_info = []
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT version()")
-                pg_version = cur.fetchone()[0]
-                db_info.append(html.P([html.Strong("PostgreSQL Version: "), html.Code(pg_version)]))
-    except:
-        db_info.append(html.P([html.Strong("PostgreSQL Version: "), "Unable to connect"]))
-    
+    # Show raw data if requested
     content = [
         html.H4("Database Management", className="mb-3"),
         dbc.Row([
@@ -492,7 +739,6 @@ def create_database_tab(df, display_options):
                         html.P([html.Strong("Total Records: "), f"{stats.get('total_records', 0):,}"]),
                         html.P([html.Strong("First Record: "), str(stats.get('first_processed', 'N/A'))]),
                         html.P([html.Strong("Last Record: "), str(stats.get('last_processed', 'N/A'))]),
-                        *db_info
                     ])
                 ])
             ], width=6),
@@ -505,7 +751,6 @@ def create_database_tab(df, display_options):
         ], className="mb-4")
     ]
     
-    # Show raw data if requested
     if 'raw' in display_options:
         content.extend([
             html.Hr(),
@@ -520,6 +765,7 @@ def create_database_tab(df, display_options):
         ])
     
     return html.Div(content)
+
 
 def create_performance_tab(df):
     """Create Performance Metrics tab"""
@@ -570,6 +816,7 @@ def create_performance_tab(df):
             dbc.Col([dcc.Graph(figure=fig_domain)], width=6)
         ])
     ])
+
 
 def create_config_tab(display_options):
     """Create Configuration tab"""
@@ -623,25 +870,219 @@ def create_config_tab(display_options):
         *debug_content
     ])
 
-# Add healthcheck endpoint for Docker
-from flask import Flask
-health_app = Flask(__name__)
 
-@health_app.route("/_health")
-def health():
-    return "OK", 200
+def create_caution_tab_ui():
+    """Render caution words tab UI"""
+    words = get_caution_words()
+    df = pd.DataFrame(words) if words else pd.DataFrame(columns=['id', 'word', 'created_at'])
+    return html.Div([
+        html.H4("Cautionary Words", className="mb-3"),
+        dbc.Row([
+            dbc.Col(dcc.Input(id='caution-new-word', placeholder='Enter a word or phrase', type='text', className='form-control'), width=8),
+            dbc.Col(dbc.Button('Add', id='caution-add-btn', color='primary', className='w-100'), width=2),
+            dbc.Col(dbc.Button('Delete Selected', id='caution-delete-btn', color='danger', className='w-100'), width=2),
+        ], className='mb-3'),
+        dash_table.DataTable(
+            id='caution-words-table',
+            data=df.to_dict('records'),
+            columns=[
+                {'name': 'ID', 'id': 'id'},
+                {'name': 'Word / Phrase', 'id': 'word'},
+                {'name': 'Added', 'id': 'created_at'}
+            ],
+            row_selectable='multi',
+            page_size=10,
+            style_table={'overflowX': 'auto'},
+            style_cell={'textAlign': 'left', 'padding': '6px'},
+            style_header={'backgroundColor': 'rgb(230, 230, 230)', 'fontWeight': 'bold'}
+        ),
+        html.Div(id='caution-feedback', className='mt-2')
+    ])
 
-# Mount healthcheck on main Flask server
-@app.server.route("/_health")
-def dash_health():
-    return "OK", 200
+# FIXED callback for caution words management
+@app.callback(
+    [Output('caution-words-table', 'data'),
+     Output('caution-feedback', 'children'),
+     Output('caution-new-word', 'value')],  # Clear input on success
+    [Input('caution-add-btn', 'n_clicks'),
+     Input('caution-delete-btn', 'n_clicks')],
+    [State('caution-new-word', 'value'),
+     State('caution-words-table', 'selected_rows'),
+     State('caution-words-table', 'data')],
+    prevent_initial_call=True
+)
+def handle_caution_actions(add_n, delete_n, new_word, selected_rows, table_data):
+    """
+    FIXED: Better feedback and input clearing
+    """
+    ctx = dash.callback_context
+    if not ctx.triggered:
+        words = get_caution_words()
+        return words, "", ""
+    
+    trig = ctx.triggered[0]['prop_id'].split('.')[0]
+    
+    if trig == 'caution-add-btn':
+        if not new_word or not new_word.strip():
+            return table_data or [], dbc.Alert(
+                "⚠️ Please enter a word or phrase", 
+                color="warning", 
+                duration=3000
+            ), dash.no_update
+        
+        ok, msg = add_caution_word(new_word)
+        
+        if ok:
+            words = get_caution_words()
+            return words, dbc.Alert(
+                f"✅ Added: '{new_word}' (normalized to lowercase)", 
+                color="success", 
+                duration=3000
+            ), ""  # Clear input
+        else:
+            if msg == "exists":
+                return table_data or [], dbc.Alert(
+                    f"⚠️ Word already exists: '{new_word}'", 
+                    color="warning", 
+                    duration=3000
+                ), dash.no_update
+            elif msg == "empty":
+                return table_data or [], dbc.Alert(
+                    "⚠️ Please enter a non-empty word", 
+                    color="warning", 
+                    duration=3000
+                ), dash.no_update
+            else:
+                return table_data or [], dbc.Alert(
+                    f"❌ Failed to add: {msg}", 
+                    color="danger", 
+                    duration=4000
+                ), dash.no_update
+    
+    elif trig == 'caution-delete-btn':
+        if not selected_rows:
+            return table_data or [], dbc.Alert(
+                "⚠️ No rows selected for deletion", 
+                color="warning", 
+                duration=3000
+            ), dash.no_update
+        
+        ids_to_remove = []
+        words_to_remove = []
+        
+        for idx in selected_rows:
+            try:
+                row = table_data[int(idx)]
+                ids_to_remove.append(row.get('id'))
+                words_to_remove.append(row.get('word', 'unknown'))
+            except Exception as e:
+                print(f"⚠️ Error processing row {idx}: {e}")
+                continue
+        
+        removed = 0
+        for rid in ids_to_remove:
+            if remove_caution_word(rid):
+                removed += 1
+        
+        words = get_caution_words()
+        
+        if removed > 0:
+            return words, dbc.Alert(
+                f"🗑️ Removed {removed} word(s): {', '.join(words_to_remove)}", 
+                color="info", 
+                duration=4000
+            ), dash.no_update
+        else:
+            return table_data or [], dbc.Alert(
+                "❌ Failed to remove selected words", 
+                color="danger", 
+                duration=3000
+            ), dash.no_update
+    
+    return table_data or [], "", dash.no_update
 
+# Diagnostic function to test caution words
+def test_caution_words_system():
+    """
+    Test function to verify caution words are working
+    Call this from admin interface or startup
+    """
+    print("\n" + "="*60)
+    print("🧪 Testing Caution Words System")
+    print("="*60)
+    
+    # Test database retrieval
+    print("\n1. Testing database retrieval...")
+    words = fetch_caution_words_from_db()
+    print(f"   Found {len(words)} words: {words[:10]}")
+    
+    # Test inference integration
+    print("\n2. Testing inference integration...")
+    try:
+        from monitor.inference_local import classify_email
+        
+        test_texts = [
+            "I am concerned about the delays",
+            "There are gaps in the documentation",
+            "Everything looks great, thank you!"
+        ]
+        
+        for text in test_texts:
+            result = classify_email(
+                text, 
+                apply_rule=True, 
+                caution_keywords=words,
+                neg_prob_thresh=0.06
+            )
+            print(f"\n   Text: {text[:50]}...")
+            print(f"   Model: {result['pred_label']} -> Final: {result['final_label']}")
+            print(f"   Reason: {result['postprocess_reason']}")
+    except Exception as e:
+        print(f"   ❌ Inference test failed: {e}")
+    
+    print("\n" + "="*60)
+    print("✅ Caution words test complete")
+    print("="*60 + "\n")
 
+# Test DB connection callback (for debug mode)
+@app.callback(
+    Output('db-test-result', 'children'),
+    Input('test-db-btn', 'n_clicks'),
+    prevent_initial_call=True
+)
+def test_db_connection(n_clicks):
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+                result = cur.fetchone()
+                if result:
+                    return dbc.Alert("✅ Database connection successful!", color="success")
+    except Exception as e:
+        return dbc.Alert(f"❌ Database connection failed: {str(e)}", color="danger")
+    return dbc.Alert("❌ Unknown error", color="danger")
+
+# Initialize admin tables on startup
+try:
+    ensure_admin_tables()
+    print("✅ Admin tables initialized")
+except Exception as e:
+    print(f"❌ ensure_admin_tables failed: {e}")
+
+# Test load on startup
+try:
+    test_df = load_db(10)
+    print(f"🧪 Startup test load: {len(test_df)} rows")
+    if not test_df.empty:
+        print(f"🧪 Columns: {list(test_df.columns)}")
+except Exception as e:
+    print(f"🧪 Startup test load FAILED: {e}")
+
+# Run app
 if __name__ == '__main__':
-    # Use the new app.run API
-    # Add healthcheck endpoint
- @app.server.route("/_health")
- def healthcheck():
-    return "OK", 200
+    @app.server.route("/_health")
+    def healthcheck():
+        return "OK", 200
 
-app.run(debug=False, host='0.0.0.0', port=PORT)
+    print(f"🚀 Starting Admin Dashboard on port {PORT}")
+    app.run(debug=False, host='0.0.0.0', port=PORT)

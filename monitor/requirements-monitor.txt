@@ -4,3 +4,5 @@ transformers
 numpy
 psycopg2-binary
 sqlalchemy
+pandas
+psycopg2-binary

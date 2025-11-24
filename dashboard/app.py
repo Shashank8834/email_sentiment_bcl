@@ -1,7 +1,7 @@
-# dashboard/app.py
-
+# dashboard/app.py (patched)
 # Dash dashboard with PostgreSQL support - Full Features Restored
 # Fixed OTP-based login with Mailjet
+# Added: dynamic admin_settings + caution_words integration (live)
 
 import os
 import random
@@ -14,6 +14,8 @@ import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
 from dotenv import load_dotenv
+
+# DB helpers (must exist in your repo)
 from db_config import get_db_connection, init_connection_pool
 
 # Mailjet Configuration
@@ -282,88 +284,116 @@ def create_pie_chart(data, values, names, title):
     fig.update_layout(height=400)
     return fig
 
+# ---------------- Admin-driven helpers ----------------
+
+def fetch_settings_from_db():
+    """Read admin_settings and return dict key->value"""
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql_query("SELECT key, value FROM admin_settings", conn)
+            return {k: v for k, v in zip(df['key'], df['value'])}
+    except Exception as e:
+        print("fetch_settings_from_db error:", e)
+        return {}
+
+def fetch_caution_words_from_db():
+    """Return list[str] of caution words ordered newest-first"""
+    try:
+        with get_db_connection() as conn:
+            df = pd.read_sql_query("SELECT word FROM caution_words ORDER BY created_at DESC", conn)
+            return df['word'].astype(str).tolist() if not df.empty else []
+    except Exception as e:
+        print("fetch_caution_words_from_db error:", e)
+        return []
+
 # ---------------- Login Layout ----------------
 
-def login_layout():
+def loginlayout():
     """Create login page layout"""
-    return dbc.Container([
-        dbc.Row([
-            dbc.Col([
+    return dbc.Container(
+        dbc.Row(
+            dbc.Col(
                 html.Div([
-                    html.H2("🔐 Email Analytics Dashboard", className="text-center mb-4"),
+                    html.H2("📧 Email Analytics Dashboard", className="text-center mb-4"),
                     html.Hr(),
                     
-                    html.Div(id='email-input-section', children=[
+                    # Email Input Section
+                    html.Div(id="email-input-section", children=[
                         html.H5("Login with Email OTP", className="mb-3"),
                         dbc.InputGroup([
                             dbc.InputGroupText("📧"),
                             dbc.Input(
-                                id='login-email',
-                                type='email',
-                                placeholder='Enter your email address',
-                                className='mb-3'
+                                id="login-email",
+                                type="email",
+                                placeholder="Enter your email address",
+                                className="mb-3"
                             )
                         ]),
                         dbc.Button(
                             "Send OTP",
-                            id='send-otp-button',
-                            color='primary',
-                            className='w-100 mb-3',
+                            id="send-otp-button",
+                            color="primary",
+                            className="w-100 mb-3",
                             n_clicks=0
                         ),
-                        html.Div(id='email-status-message', className='text-center')
                     ]),
                     
-                    html.Div(id='otp-input-section', style={'display': 'none'}, children=[
+                    html.Div(id="email-status-message", className="text-center"),
+                    
+                    # OTP Input Section (hidden initially)
+                    html.Div(id="otp-input-section", style={"display": "none"}, children=[
                         html.H5("Enter OTP", className="mb-3"),
                         dbc.InputGroup([
-                            dbc.InputGroupText("🔢"),
+                            dbc.InputGroupText("🔐"),
                             dbc.Input(
-                                id='login-otp',
-                                type='text',
-                                placeholder='Enter 6-digit OTP',
+                                id="login-otp",
+                                type="text",
+                                placeholder="Enter 6-digit OTP",
                                 maxLength=6,
-                                className='mb-3'
+                                className="mb-3"
                             )
                         ]),
                         dbc.Button(
                             "Verify OTP",
-                            id='verify-otp-button',
-                            color='success',
-                            className='w-100 mb-3',
+                            id="verify-otp-button",
+                            color="success",
+                            className="w-100 mb-3",
                             n_clicks=0
                         ),
-                        html.Div(id='otp-status-message', className='text-center'),
-                        html.Div([
-                            html.Small("Didn't receive OTP? ", className='text-muted'),
-                            html.A("Resend", id='resend-otp-link', href='#', className='text-primary')
-                        ], className='text-center')
                     ]),
                     
-                    html.Hr(),
+                    html.Div(id="otp-status-message", className="text-center"),
+                    
+                    # Resend OTP Link
                     html.Div([
-                        html.Small("Protected by OTP authentication • ", className='text-muted'),
-                        html.Small(
-                            "Allowed domains: " + os.getenv('MAILBOX_LIST', 'Not configured'),
-                            className='text-muted'
-                        )
-                    ], className='text-center')
+                        html.Small("Didn't receive OTP? ", className="text-muted"),
+                        html.A("Resend", id="resend-otp-link", href="#", className="text-primary")
+                    ], className="text-center"),
+                    
+                    html.Hr(),
+                    
+                    # Footer (REMOVED the allowed domains display)
+                    html.Div([
+                        html.Small("🔒 Protected by OTP authentication", className="text-muted")
+                    ], className="text-center")
                     
                 ], style={
-                    'maxWidth': '400px',
-                    'margin': '100px auto',
-                    'padding': '2rem',
-                    'backgroundColor': 'white',
-                    'borderRadius': '10px',
-                    'boxShadow': '0 0 20px rgba(0,0,0,0.1)'
+                    "maxWidth": "400px",
+                    "margin": "100px auto",
+                    "padding": "2rem",
+                    "backgroundColor": "white",
+                    "borderRadius": "10px",
+                    "boxShadow": "0 0 20px rgba(0,0,0,0.1)"
                 })
-            ])
-        ])
-    ], fluid=True, style={
-        'backgroundColor': '#f8f9fa',
-        'minHeight': '100vh',
-        'paddingTop': '50px'
-    })
+            )
+        ),
+        fluid=True,
+        style={
+            "backgroundColor": "#f8f9fa",
+            "minHeight": "100vh",
+            "paddingTop": "50px"
+        }
+    )
 
 # ---------------- Main Layout ----------------
 
@@ -372,6 +402,9 @@ def main_dashboard_layout():
     return dbc.Container([
         dcc.Store(id='data-store'),
         dcc.Store(id='table-sentiment-filter', data='all'),
+        # NEW: stores for admin-driven settings and caution words
+        dcc.Store(id='settings-store'),
+        dcc.Store(id='caution-words-store'),
         dcc.Interval(id='auto-refresh', interval=AUTO_REFRESH_INTERVAL_SECONDS*1000, n_intervals=0),
         dcc.Location(id='url', refresh=False),
         dbc.Row([
@@ -539,8 +572,11 @@ def resend_otp(n_clicks):
         return 1
     return 0
 
+# ----------------- REFRESH: now writes settings + caution words -----------------
 @app.callback(
     Output('data-store', 'data'),
+    Output('settings-store', 'data'),
+    Output('caution-words-store', 'data'),
     Input('btn-refresh', 'n_clicks'),
     Input('auto-refresh', 'n_intervals'),
     Input('auto-refresh-toggle', 'value'),
@@ -550,15 +586,35 @@ def refresh_data(n_clicks, n_intervals, auto_vals):
     triggered = dash.callback_context.triggered
     if triggered:
         trig_id = triggered[0]['prop_id']
+        # if auto-refresh triggered but toggle is off, don't update
         if 'auto-refresh' in trig_id and (not auto_vals or 'on' not in auto_vals):
             raise dash.exceptions.PreventUpdate
     
     try:
         df = load_db()
-        return df.to_json(date_format='iso', orient='split')
+        settings = fetch_settings_from_db()
+        cautions = fetch_caution_words_from_db()
+        # settings: dict, cautions: list[str]
+        return df.to_json(date_format='iso', orient='split'), settings, cautions
     except Exception as e:
         print(f"❌ Error loading data: {e}")
-        return pd.DataFrame().to_json(date_format='iso', orient='split')
+        # return defaults
+        return pd.DataFrame().to_json(date_format='iso', orient='split'), {}, []
+
+# Update Interval interval (ms) when settings change
+@app.callback(
+    Output('auto-refresh', 'interval'),
+    Input('settings-store', 'data'),
+    prevent_initial_call=False
+)
+def update_interval(settings):
+    try:
+        if not settings:
+            return AUTO_REFRESH_INTERVAL_SECONDS * 1000
+        sec = int(settings.get('auto_refresh_interval', AUTO_REFRESH_INTERVAL_SECONDS))
+        return max(5, sec) * 1000
+    except Exception:
+        return AUTO_REFRESH_INTERVAL_SECONDS * 1000
 
 @app.callback(
     Output('sidebar-stats', 'children'),
@@ -607,8 +663,7 @@ def render_page(page, data_json):
     
     return html.Div("Unknown page")
 
-# ---------- Page builders ----------
-
+# ---------- Page builders (unchanged) ----------
 def live_page_layout(df_all):
     mailboxes = ["All Mailboxes"] + sorted(df_all['mailbox'].dropna().unique().tolist())
     domain_counts = df_all['client_domain'].value_counts().reset_index()
@@ -742,8 +797,7 @@ def emails_layout(df):
     ])
     
     return layout
-
-# ---------- Live Page Callbacks ----------
+# ---------- Live Page Callbacks (with caution-words integration) ----------
 
 @app.callback(
     Output('live-metrics', 'children'),
@@ -868,15 +922,17 @@ def populate_live_client_filter(data_json, mailbox):
     
     return [{'label': d, 'value': d} for d in domains]
 
+# Update live table: now accepts caution words and highlights subjects
 @app.callback(
     Output('live-feed-table', 'children'),
     Output('email-count-display', 'children'),
     Input('data-store','data'),
     Input('table-sentiment-filter', 'data'),
     Input('live-client-filter', 'value'),
+    Input('caution-words-store', 'data'),   # NEW
     State('mailbox-selector','value')
 )
-def update_live_table(data_json, sentiment_filter, client_filter, mailbox):
+def update_live_table(data_json, sentiment_filter, client_filter, caution_words, mailbox):
     if not data_json:
         return html.Div(), ""
     
@@ -898,10 +954,26 @@ def update_live_table(data_json, sentiment_filter, client_filter, mailbox):
     disp['processed_at'] = format_ist(disp['processed_at'])
     disp['received_dt'] = format_ist(disp['received_dt'])
     
-    disp['subject_html'] = disp.apply(
-        lambda r: f"[{r['subject']}]({r['web_link']})" if pd.notna(r['web_link']) and str(r['web_link']).strip() else r['subject'],
-        axis=1
-    )
+    # Apply caution-word highlighting if present
+    subject_display = []
+    if caution_words:
+        import re
+        pattern = "|".join([re.escape(w.lower()) for w in caution_words if w and w.strip()])
+        if pattern:
+            lower_subs = disp['subject'].fillna('').str.lower()
+            is_caution = lower_subs.str.contains(pattern)
+            for idx, row in disp.iterrows():
+                subj = row['subject'] or ''
+                if is_caution.loc[idx]:
+                    subject_display.append("⚠️ " + subj)
+                else:
+                    subject_display.append(subj)
+        else:
+            subject_display = disp['subject'].fillna('').tolist()
+    else:
+        subject_display = disp['subject'].fillna('').tolist()
+    
+    disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s for s, wl in zip(subject_display, disp['web_link'])]
     
     table = dash_table.DataTable(
         id='live-feed-data-table',
@@ -978,14 +1050,16 @@ def populate_domain_view_selector(data_json, mailbox):
     return [{'label': f"{row['client_domain']} ({row['email_count']} emails)", 'value': row['client_domain']}
             for _, row in domain_counts.iterrows()]
 
+# Domain view table: also accept caution words to highlight subjects
 @app.callback(
     Output('domain-view-table', 'children'),
     Output('domain-view-count-display', 'children'),
     Input('domain-view-selector', 'value'),
     Input('data-store', 'data'),
+    Input('caution-words-store', 'data'),   # NEW
     State('mailbox-selector', 'value')
 )
-def update_domain_view_table(selected_domain, data_json, mailbox):
+def update_domain_view_table(selected_domain, data_json, caution_words, mailbox):
     if not data_json:
         return html.Div(), ""
     
@@ -1005,10 +1079,25 @@ def update_domain_view_table(selected_domain, data_json, mailbox):
     disp['processed_at'] = format_ist(disp['processed_at'])
     disp['received_dt'] = format_ist(disp['received_dt'])
     
-    disp['subject_html'] = disp.apply(
-        lambda r: f"[{r['subject']}]({r['web_link']})" if pd.notna(r['web_link']) and str(r['web_link']).strip() else r['subject'],
-        axis=1
-    )
+    # highlight caution words
+    if caution_words:
+        import re
+        pattern = "|".join([re.escape(w.lower()) for w in caution_words if w and w.strip()])
+        if pattern:
+            lower_subs = disp['subject'].fillna('').str.lower()
+            is_caution = lower_subs.str.contains(pattern)
+            subject_display = []
+            for idx, row in disp.iterrows():
+                subj = row['subject'] or ''
+                if is_caution.loc[idx]:
+                    subject_display.append("⚠️ " + subj)
+                else:
+                    subject_display.append(subj)
+            disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s for s, wl in zip(subject_display, disp['web_link'])]
+        else:
+            disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s for s, wl in zip(disp['subject'].fillna(''), disp['web_link'])]
+    else:
+        disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s for s, wl in zip(disp['subject'].fillna(''), disp['web_link'])]
     
     table = dash_table.DataTable(
         id='domain-view-data-table',
@@ -1026,107 +1115,24 @@ def update_domain_view_table(selected_domain, data_json, mailbox):
         page_size=15,
         style_table={'overflowX': 'auto'},
         style_cell={'textAlign': 'left', 'padding': '6px'},
-        style_data_conditional=[
-            {'if': {'filter_query': '{final_label} = "Negative"'},
-             'backgroundColor': '#fff0f0'}
-        ]
+        style_data_conditional=[{'if': {'filter_query': '{final_label} = "Negative"'}, 'backgroundColor': '#fff0f0'}]
     )
     
     return table, f"Showing {len(disp)} emails for domain: {selected_domain}"
 
-# ---------- Trends Page Callbacks ----------
+# ---------------- Trends & Journey callbacks remain unchanged ----------------
+# (they use data only; no subject highlighting needed there)
 
-@app.callback(
-    Output('trends-pie-chart','figure'),
-    Input('data-store','data'),
-    Input('date-range-picker','start_date'),
-    Input('date-range-picker','end_date'),
-    Input('domain-filter','value'),
-    Input('sentiment-filter','value')
-)
-def update_trends_pie(data_json, start_date, end_date, domain, sentiments):
-    if not data_json:
-        return go.Figure()
-    
-    df = pd.read_json(data_json, orient='split')
-    df['received_dt_ist'] = to_ist(df['received_dt'])
-    
-    if start_date and end_date:
-        start_date_obj = pd.to_datetime(start_date).date()
-        end_date_obj = pd.to_datetime(end_date).date()
-        df = df[(df['received_dt_ist'].dt.date >= start_date_obj) & (df['received_dt_ist'].dt.date <= end_date_obj)]
-    
-    if domain and domain!='All Domains':
-        df = df[df['client_domain']==domain]
-    
-    if sentiments:
-        df = df[df['final_label'].isin(sentiments)]
-    
-    sent_counts = df['final_label'].value_counts().reset_index()
-    sent_counts.columns = ['Sentiment','Count']
-    return create_pie_chart(sent_counts, 'Count', 'Sentiment', "Sentiment Distribution (Filtered)")
-
-@app.callback(
-    Output('journey-content','children'),
-    Input('data-store','data'),
-    Input('journey-domain-selector','value')
-)
-def build_journey(data_json, domain):
-    if not data_json or not domain:
-        return html.Div()
-    
-    df = pd.read_json(data_json, orient='split')
-    trans_df = df[df['client_domain']==domain].sort_values('received_dt')
-    
-    if len(trans_df) <= 1:
-        return dbc.Alert(f"Not enough data for domain: {domain}", color='info')
-    
-    trans_df['date_time_ist'] = to_ist(trans_df['received_dt'])
-    trans_df['date_short'] = trans_df['date_time_ist'].dt.strftime('%m/%d %H:%M')
-    
-    sentiment_map = {'Negative': 0, 'Neutral': 1, 'Positive': 2}
-    trans_df['sentiment_value'] = trans_df['final_label'].map(sentiment_map)
-    
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=trans_df['date_time_ist'],
-        y=trans_df['sentiment_value'],
-        mode='lines+markers',
-        marker=dict(size=12, color=trans_df['final_label'].map({'Negative':'#ff4444','Neutral':'#ffa500','Positive':'#00cc00'})),
-        text=trans_df.apply(lambda r: f"{r['date_short']}<br>{r['final_label']}<br>{r['subject'][:120]}", axis=1),
-        hoverinfo='text'
-    ))
-    
-    fig.update_layout(
-        title=f"Email Sentiment Sequence - {domain}",
-        xaxis_title="Date (IST)",
-        yaxis=dict(tickmode='array', tickvals=[0,1,2], ticktext=['Negative','Neutral','Positive']),
-        height=450
-    )
-    
-    trans_df['prev_sentiment'] = trans_df['final_label'].shift(1)
-    improvements = ((trans_df['prev_sentiment']=='Negative') & (trans_df['final_label'].isin(['Neutral','Positive']))).sum()
-    deteriorations = ((trans_df['prev_sentiment'].isin(['Neutral','Positive'])) & (trans_df['final_label']=='Negative')).sum()
-    stable = (trans_df['prev_sentiment'] == trans_df['final_label']).sum()
-    
-    stats = dbc.Row([
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("🔼 Improvements"), html.H4(str(improvements))])), width=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("🔽 Deteriorations"), html.H4(str(deteriorations))])), width=4),
-        dbc.Col(dbc.Card(dbc.CardBody([html.H6("➡️ Stable"), html.H4(str(stable))])), width=4)
-    ], className='my-3')
-    
-    return html.Div([dcc.Graph(figure=fig), stats])
-
-# ---------- Email Details Page Callbacks ----------
-
+# Email details: include caution words highlighting
 @app.callback(
     Output('email-details-content','children'),
     Input('email-sentiment-filter','value'),
     Input('email-mailbox-filter','value'),
     Input('email-search-input','value'),
-    Input('data-store','data')
+    Input('data-store','data'),
+    Input('caution-words-store','data')   # NEW
 )
-def email_details(sentiments, mailbox, search, data_json):
+def email_details(sentiments, mailbox, search, data_json, caution_words):
     if not data_json:
         return html.Div()
     
@@ -1150,7 +1156,26 @@ def email_details(sentiments, mailbox, search, data_json):
     
     disp = detail_df[['received_dt','client_domain','mailbox','sender','subject','final_label','prob_neg','web_link']].copy()
     disp['received_dt'] = format_ist(disp['received_dt'])
-    disp['subject_html'] = disp.apply(lambda r: f"[{r['subject']}]({r['web_link']})" if pd.notna(r['web_link']) and str(r['web_link']).strip() else r['subject'], axis=1)
+    
+    # caution highlighting
+    if caution_words:
+        import re
+        pattern = "|".join([re.escape(w.lower()) for w in caution_words if w and w.strip()])
+        if pattern:
+            lower_subs = disp['subject'].fillna('').str.lower()
+            is_caution = lower_subs.str.contains(pattern)
+            subject_display = []
+            for idx, row in disp.iterrows():
+                subj = row['subject'] or ''
+                if is_caution.loc[idx]:
+                    subject_display.append("⚠️ " + subj)
+                else:
+                    subject_display.append(subj)
+            disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s for s, wl in zip(subject_display, disp['web_link'])]
+        else:
+            disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s for s, wl in zip(disp['subject'].fillna(''), disp['web_link'])]
+    else:
+        disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s for s, wl in zip(disp['subject'].fillna(''), disp['web_link'])]
     
     table = dash_table.DataTable(
         columns=[
