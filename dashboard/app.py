@@ -308,7 +308,7 @@ def fetch_caution_words_from_db():
 
 # ---------------- Login Layout ----------------
 
-def loginlayout():
+def login_layout():
     """Create login page layout"""
     return dbc.Container(
         dbc.Row(
