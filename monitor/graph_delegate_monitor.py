@@ -1,6 +1,13 @@
 # monitor/graph_delegate_monitor.py
+
 # Enhanced App-only Graph monitor with PostgreSQL-backed admin settings & caution words
 # Optimized for high-volume processing with pagination and batch operations
+
+# MODIFICATIONS:
+# 1. Fixed 24/7 monitoring with robust error handling and recovery
+# 2. Changed default lookback to 30 days to fetch past 1 month of emails
+# 3. Added domain filtering to exclude bank mails and ads (youtube, substack, etc.)
+# 4. Fixed pandas SQLAlchemy warnings by replacing pd.read_sql_query with cursor operations
 
 import os
 import time
@@ -10,7 +17,7 @@ from datetime import datetime, timedelta
 from msal import ConfidentialClientApplication
 from db_config import get_db_connection, ensure_schema, init_connection_pool
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import pandas as pd
+import traceback
 
 # ---------------- CONFIG from ENV (defaults; DB can override these each cycle) ----------------
 CLIENT_ID = os.getenv("CLIENT_ID")
@@ -22,9 +29,45 @@ MAILBOX_LIST = os.getenv("MAILBOX_LIST", "")
 MODEL_DIR = os.getenv("INFERENCE_MODEL_DIR", "/data/model")
 FETCH_READ_EMAILS = os.getenv("FETCH_READ_EMAILS", "False").lower() in ("1", "true", "yes")
 MAX_EMAILS_PER_POLL = int(os.getenv("MAX_EMAILS_PER_POLL", "50"))
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "7"))
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "30"))  # CHANGED: 7 -> 30 days for past 1 month
 MARK_AS_READ_ENV = os.getenv("MARK_AS_READ", "False").lower() in ("1", "true", "yes")
 NEG_PROB_THRESH = float(os.getenv("NEG_PROB_THRESH", "0.06"))
+
+# NEW: Domain filtering configuration
+EXCLUDED_DOMAINS_ENV = os.getenv("EXCLUDED_DOMAINS", "")
+# Default excluded domains - banks and ads
+DEFAULT_EXCLUDED_DOMAINS = [
+    # Indian Banks
+    "icicibank.com", "hdfcbank.com", "sbi.co.in", "axisbank.com", 
+    "kotak.com", "yesbank.in", "pnbindia.in", "bankofbaroda.in",
+    "indusind.com", "rbl.com", "idfcfirstbank.com",
+
+    # International Banks
+    "citibank.com", "sc.com", "hsbc.com", "dbs.com",
+    "chase.com", "wellsfargo.com", "bankofamerica.com",
+
+    # Payment platforms
+    "paytm.com", "phonepe.com", "googlepay.com", "amazonpay.in",
+    "paypal.com", "stripe.com", "razorpay.com",
+
+    # Ads and newsletters
+    "youtube.com", "substack.com", "medium.com", "linkedin.com",
+    "facebook.com", "twitter.com", "instagram.com", "pinterest.com",
+
+    # Email marketing platforms
+    "amazonaws.com", "mailchimp.com", "sendgrid.net",
+    "mailgun.org", "postmarkapp.com", "sparkpostmail.com",
+    "mandrillapp.com", "amazonses.com",
+]
+
+# Combine custom and default excluded domains
+if EXCLUDED_DOMAINS_ENV.strip():
+    EXCLUDED_DOMAINS = [d.strip().lower() for d in EXCLUDED_DOMAINS_ENV.split(",") if d.strip()]
+    ALL_EXCLUDED_DOMAINS = list(set(DEFAULT_EXCLUDED_DOMAINS + EXCLUDED_DOMAINS))
+else:
+    ALL_EXCLUDED_DOMAINS = DEFAULT_EXCLUDED_DOMAINS
+
+print(f"🚫 Filtering {len(ALL_EXCLUDED_DOMAINS)} excluded domains")
 
 # ---------------------------------------------------------------------------------------------
 if not CLIENT_ID or not TENANT_ID or not CLIENT_SECRET:
@@ -37,9 +80,11 @@ try:
     from inference_local import classify_email
 except Exception as e:
     print(f"⚠️ Warning: inference_local.classify_email not found; using fallback. {e}")
+
     def classify_email(text, model_dir=None, apply_rule=True, neg_prob_thresh=0.06, caution_keywords=None):
         """Fallback classifier when inference_local is not available"""
         t = (text or "").lower()
+
         # Check caution keywords first (if provided)
         if caution_keywords:
             for kw in caution_keywords:
@@ -50,6 +95,7 @@ except Exception as e:
                         "probs": [0.9, 0.08, 0.02],
                         "postprocess_reason": f"caution_keyword:{kw}"
                     }
+
         # Simple keyword-based classification
         if any(x in t for x in ("disappoint", "unresolved", "delay", "not happy", "unable", "concern", "issue", "problem", "urgent", "complaint", "frustrated","gaps", "missing", "bad", "angry", "dissatisfied")):
             return {"final_label": "Negative", "pred_label": "Negative", "probs": [0.9, 0.08, 0.02], "postprocess_reason": "fallback"}
@@ -60,10 +106,13 @@ except Exception as e:
 # ---------------- Stats tracking ----------------
 stats = {
     'total_processed': 0,
+    'filtered_out': 0,
     'by_mailbox': {},
     'by_sentiment': {'Negative': 0, 'Neutral': 0, 'Positive': 0},
     'errors': 0,
-    'start_time': datetime.utcnow()
+    'consecutive_errors': 0,
+    'start_time': datetime.utcnow(),
+    'last_success': datetime.utcnow()
 }
 
 def update_stats(mailbox, sentiment):
@@ -71,6 +120,8 @@ def update_stats(mailbox, sentiment):
     stats['total_processed'] += 1
     stats['by_mailbox'][mailbox] = stats['by_mailbox'].get(mailbox, 0) + 1
     stats['by_sentiment'][sentiment] = stats['by_sentiment'].get(sentiment, 0) + 1
+    stats['consecutive_errors'] = 0
+    stats['last_success'] = datetime.utcnow()
 
 def print_stats():
     """Print current statistics"""
@@ -80,7 +131,9 @@ def print_stats():
     print("="*60)
     print(f"⏱️ Runtime: {runtime}")
     print(f"📧 Total Processed: {stats['total_processed']}")
+    print(f"🚫 Filtered Out: {stats['filtered_out']}")
     print(f"❌ Errors: {stats['errors']}")
+    print(f"🕐 Last Success: {stats['last_success'].strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print("\nBy Mailbox:")
     for mailbox, count in sorted(stats['by_mailbox'].items()):
         print(f"  📬 {mailbox}: {count}")
@@ -89,6 +142,23 @@ def print_stats():
         emoji = {"Negative": "🔴", "Neutral": "🟡", "Positive": "🟢"}.get(sentiment, "⚪")
         print(f"  {emoji} {sentiment}: {count}")
     print("="*60 + "\n")
+
+# NEW: Domain filtering function
+def is_excluded_domain(email_addr):
+    """Check if email is from an excluded domain"""
+    if not email_addr:
+        return False
+
+    domain = extract_domain(email_addr)
+    if not domain:
+        return False
+
+    # Check exact match or subdomain match
+    for excluded in ALL_EXCLUDED_DOMAINS:
+        if domain == excluded or domain.endswith("." + excluded):
+            return True
+
+    return False
 
 # ---------------- DB helpers for admin settings & caution words ----------------
 def ensure_admin_tables():
@@ -99,18 +169,20 @@ def ensure_admin_tables():
         word TEXT NOT NULL UNIQUE,
         created_at TIMESTAMPTZ DEFAULT now()
     );
+
     CREATE TABLE IF NOT EXISTS admin_settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at TIMESTAMPTZ DEFAULT now()
     );
+
     -- Seed default settings if not exist
     INSERT INTO admin_settings (key, value)
     VALUES
         ('neg_prob_thresh', '0.06'),
         ('poll_interval', '30'),
         ('max_emails_per_poll', '50'),
-        ('lookback_days', '7'),
+        ('lookback_days', '30'),
         ('fetch_read_emails', 'false'),
         ('mark_as_read', 'false')
     ON CONFLICT (key) DO NOTHING;
@@ -125,25 +197,25 @@ def ensure_admin_tables():
         print(f"⚠️ ensure_admin_tables error: {e}")
 
 def fetch_settings_from_db():
-    """Return admin settings as dict (key->value)."""
+    """Return admin settings as dict (key->value). FIXED: No pandas warnings."""
     try:
         with get_db_connection() as conn:
-            df = pd.read_sql_query("SELECT key, value FROM admin_settings", conn)
-            if df.empty:
-                return {}
-            return {k: v for k, v in zip(df['key'], df['value'])}
+            with conn.cursor() as cur:
+                cur.execute("SELECT key, value FROM admin_settings")
+                rows = cur.fetchall()
+                return {row[0]: row[1] for row in rows}
     except Exception as e:
         print(f"⚠️ fetch_settings_from_db error: {e}")
         return {}
 
 def fetch_caution_words_from_db():
-    """Return list[str] of caution words ordered newest-first."""
+    """Return list[str] of caution words ordered newest-first. FIXED: No pandas warnings."""
     try:
         with get_db_connection() as conn:
-            df = pd.read_sql_query("SELECT word FROM caution_words ORDER BY created_at DESC", conn)
-            if df.empty:
-                return []
-            return df['word'].astype(str).tolist()
+            with conn.cursor() as cur:
+                cur.execute("SELECT word FROM caution_words ORDER BY created_at DESC")
+                rows = cur.fetchall()
+                return [row[0] for row in rows if row[0]]
     except Exception as e:
         print(f"⚠️ fetch_caution_words_from_db error: {e}")
         return []
@@ -169,7 +241,6 @@ def get_processed_message_ids(message_ids):
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                # Use IN clause for batch lookup
                 cur.execute(
                     "SELECT message_id FROM processed WHERE message_id = ANY(%s)",
                     (list(message_ids),)
@@ -180,7 +251,7 @@ def get_processed_message_ids(message_ids):
         return set()
 
 def mark_processed(msg_id, mailbox, sender, receivers, cc, subject, received_dt,
-                    web_link, final_label, prob_neg, sender_domain):
+                   web_link, final_label, prob_neg, sender_domain):
     """Insert or update processed message"""
     if not msg_id:
         return False
@@ -203,7 +274,7 @@ def mark_processed(msg_id, mailbox, sender, receivers, cc, subject, received_dt,
                     sender or "",
                     receivers or "",
                     cc or "",
-                    (subject or "")[:500],  # Truncate subject
+                    (subject or "")[:500],
                     received_dt or None,
                     web_link or "",
                     final_label or "Neutral",
@@ -239,65 +310,64 @@ def headers_from_token(token):
 
 # ---------------- Graph helpers ----------------
 def fetch_emails_for_user(access_token, user, top=50, fetch_read=False, lookback_days=None):
-    """Fetch emails from user's inbox with PAGINATION support - FIXED"""
+    """Fetch emails from user's inbox with PAGINATION support"""
     if lookback_days is None:
         lb = LOOKBACK_DAYS
     else:
         lb = int(lookback_days)
-    
+
     url = f"{GRAPH_V1}/users/{user}/mailFolders/Inbox/messages"
-    
+
     # Build filter
     filters = []
     lookback_date = (datetime.utcnow() - timedelta(days=lb)).strftime('%Y-%m-%dT%H:%M:%SZ')
     filters.append(f"receivedDateTime ge {lookback_date}")
-    
+
     if not fetch_read:
         filters.append("isRead eq false")
-    
+
     filter_string = " and ".join(filters)
+
     params = {
-        "$top": "999",  # Max per page (Graph API limit)
+        "$top": "999",
         "$filter": filter_string,
         "$select": "id,subject,from,receivedDateTime,bodyPreview,isRead",
         "$orderby": "receivedDateTime desc"
     }
-    
+
     all_emails = []
     page_count = 0
-    max_pages = (top // 999) + 1  # Calculate max pages needed
-    
+    max_pages = (top // 999) + 1
+
     try:
         while url and page_count < max_pages:
             r = requests.get(
-                url, 
-                headers=headers_from_token(access_token), 
+                url,
+                headers=headers_from_token(access_token),
                 params=params if page_count == 0 else None,
-                timeout=60  # Increased timeout for large responses
+                timeout=60
             )
             r.raise_for_status()
             data = r.json()
-            
+
             page_emails = data.get("value", [])
             all_emails.extend(page_emails)
             page_count += 1
-            
-            print(f"   📄 Page {page_count}: fetched {len(page_emails)} emails (total: {len(all_emails)})")
-            
-            # Check if we've reached the limit
+
+            print(f"  📄 Page {page_count}: fetched {len(page_emails)} emails (total: {len(all_emails)})")
+
             if len(all_emails) >= top:
                 all_emails = all_emails[:top]
                 break
-            
-            # Get next page URL
+
             url = data.get("@odata.nextLink")
-            params = None  # Don't use params for subsequent requests
-            
+            params = None
+
             if not url or len(page_emails) == 0:
                 break
-        
+
         return all_emails
-        
+
     except requests.exceptions.HTTPError as e:
         if e.response.status_code == 404:
             print(f"⚠️ Mailbox not found or no access: {user}")
@@ -343,6 +413,7 @@ def list_users_app_mode(access_token, top=999):
     users = []
     url = f"{GRAPH_V1}/users"
     params = {"$select": "id,userPrincipalName,mail", "$top": str(top)}
+
     try:
         while url:
             r = requests.get(
@@ -353,12 +424,15 @@ def list_users_app_mode(access_token, top=999):
             )
             r.raise_for_status()
             data = r.json()
+
             for u in data.get("value", []):
                 upn = u.get("userPrincipalName") or u.get("mail")
                 if upn:
                     users.append(upn)
+
             url = data.get("@odata.nextLink")
             params = None
+
         return users
     except Exception as e:
         print(f"❌ Failed to list users: {e}")
@@ -376,33 +450,37 @@ def recipients_to_csv(recipients):
     out = []
     if not recipients:
         return ""
-    # Handle different recipient formats
+
     if isinstance(recipients, dict) and "value" in recipients:
         recipients = recipients.get("value", [])
+
     if isinstance(recipients, str):
         return ",".join([a.strip() for a in recipients.replace(";", ",").split(",") if a.strip()])
+
     try:
         for r in recipients:
             if not r:
                 continue
+
             if isinstance(r, str):
                 addr = r.strip()
                 if addr:
                     out.append(addr)
                 continue
+
             if isinstance(r, dict):
                 addr = None
-                # Try different dict structures
                 if "emailAddress" in r and isinstance(r["emailAddress"], dict):
                     addr = r["emailAddress"].get("address")
                 elif "address" in r:
                     addr = r.get("address")
                 elif "email" in r:
                     addr = r.get("email")
+
                 if addr:
                     out.append(addr)
                     continue
-                # Handle nested structures
+
                 if "value" in r and isinstance(r["value"], list):
                     for rr in r["value"]:
                         if isinstance(rr, dict):
@@ -415,13 +493,14 @@ def recipients_to_csv(recipients):
                     out.append(s)
     except Exception as e:
         print(f"⚠️ Error parsing recipients: {e}")
-    # Deduplicate
+
     seen = set()
     deduped = []
     for a in out:
         if a and a not in seen:
             deduped.append(a)
             seen.add(a)
+
     return ",".join(deduped)
 
 EMAIL_RE = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
@@ -430,13 +509,13 @@ def extract_cc(full_message, body_preview=""):
     """Extract CC recipients from message"""
     if not full_message:
         return ""
-    # Try ccRecipients field first
+
     cc_recipients = full_message.get("ccRecipients")
     if cc_recipients:
         cc_csv = recipients_to_csv(cc_recipients)
         if cc_csv:
             return cc_csv
-    # Try internet message headers
+
     headers = full_message.get("internetMessageHeaders") or []
     if headers and isinstance(headers, list):
         for h in headers:
@@ -470,9 +549,10 @@ def extract_cc(full_message, body_preview=""):
                         return val.strip()
             except Exception:
                 continue
-    # Last resort: parse body preview
+
     if not body_preview:
         body_preview = full_message.get("bodyPreview") or ""
+
     if body_preview and isinstance(body_preview, str):
         for line in body_preview.splitlines():
             line_stripped = line.strip()
@@ -489,9 +569,9 @@ def extract_cc(full_message, body_preview=""):
                             dedup.append(e)
                             seen.add(e)
                     return ",".join(dedup)
+
     return ""
 
-# ---------------- Helper to safely parse settings ----------------
 def safe_int(value, default):
     """Safely parse int from value"""
     try:
@@ -516,18 +596,33 @@ def safe_bool(value, default):
 
 # ---------------- Main Processing ----------------
 def process_message(access_token, mailbox, msg_basic, settings, caution_words, skip_duplicate_check=False):
-    """Process a single email message"""
+    """Process a single email message with domain filtering"""
     mid = msg_basic.get("id")
     subj = (msg_basic.get("subject") or "")[:400]
-    
+
     if not mid:
         return False
-    
-    # Skip duplicate check if already done in batch
+
     if not skip_duplicate_check and is_processed(mid):
         return False
-    
-    # Fetch full message details
+
+    # Extract and check sender domain
+    try:
+        fr = msg_basic.get("from")
+        sender = ""
+        if isinstance(fr, dict):
+            sender = fr.get("emailAddress", {}).get("address") or ""
+        elif isinstance(fr, str):
+            sender = fr
+
+        if sender and is_excluded_domain(sender):
+            stats['filtered_out'] += 1
+            print(f"  🚫 FILTERED: {subj[:60]} (from {sender})")
+            return False
+    except Exception as e:
+        print(f"⚠️ Error checking sender domain: {e}")
+
+    # Fetch full message
     try:
         full = get_full_message(access_token, mailbox, mid)
         if not full:
@@ -535,45 +630,28 @@ def process_message(access_token, mailbox, msg_basic, settings, caution_words, s
     except Exception as e:
         print(f"⚠️ Failed to fetch full metadata for {mid}: {e}")
         full = msg_basic
-    
-    # Extract sender
-    sender = ""
-    try:
-        fr = full.get("from") or msg_basic.get("from")
-        if isinstance(fr, dict):
-            sender = fr.get("emailAddress", {}).get("address") or ""
-        elif isinstance(fr, str):
-            sender = fr
-    except Exception:
-        sender = ""
-    
-    # Extract recipients
+
     to_recipients = full.get("toRecipients") or []
     receivers_s = recipients_to_csv(to_recipients)
-    
-    # Extract CC
     cc_s = extract_cc(full, body_preview=(full.get("bodyPreview") or msg_basic.get("bodyPreview", "")))
+
     if DEBUG_CC:
         print(f"  🔍 DEBUG CC - Subject: {subj[:50]}")
         print(f"  🔍 DEBUG CC - Raw ccRecipients: {full.get('ccRecipients')}")
         print(f"  🔍 DEBUG CC - Extracted CC: '{cc_s}'")
-    
-    # Extract metadata
+
     received_dt = full.get("receivedDateTime") or msg_basic.get("receivedDateTime") or ""
     web_link = full.get("webLink") or ""
     is_read = full.get("isRead", msg_basic.get("isRead", False))
-    
-    # Prepare text for classification
+
     text_for_classify = (
         (full.get("subject", "") or subj) +
         "\n\n" +
         (full.get("bodyPreview") or msg_basic.get("bodyPreview", "") or "")
     )
-    
-    # Determine neg threshold from settings
+
     neg_thresh = safe_float(settings.get("neg_prob_thresh") if settings else None, NEG_PROB_THRESH)
-    
-    # Classify sentiment
+
     try:
         res = classify_email(
             text_for_classify,
@@ -590,49 +668,53 @@ def process_message(access_token, mailbox, msg_basic, settings, caution_words, s
             "probs": [0.0, 1.0, 0.0],
             "postprocess_reason": "error"
         }
-    
+
     final = res.get("final_label") or str(res.get("final_idx", "Neutral"))
     probs = res.get("probs", [0.0, 0.0, 0.0])
     p_neg = float(probs[0]) if len(probs) > 0 else 0.0
     sender_domain = extract_domain(sender)
-    
-    # Log processing
+
     sentiment_emoji = {"Negative": "🔴", "Neutral": "🟡", "Positive": "🟢"}.get(final, "⚪")
     print(f"  {sentiment_emoji} {subj[:80]} → {final} (neg={p_neg:.3f})")
     if cc_s:
-        print(f"   📎 CC: {cc_s[:100]}")
-    
-    # Save to database
+        print(f"    📎 CC: {cc_s[:100]}")
+
     success = mark_processed(
         mid, mailbox, sender, receivers_s, cc_s, subj,
         received_dt, web_link, final, p_neg, sender_domain
     )
-    
+
     if success:
         update_stats(mailbox, final)
-    
-    # Optionally mark as read
+
     mark_read_setting = safe_bool(settings.get('mark_as_read') if settings else None, MARK_AS_READ_ENV)
     if not is_read and mark_read_setting:
         mark_as_read(access_token, mailbox, mid)
-    
+
     return success
 
 # ---------------- Main Loop ----------------
 def main():
     print("\n" + "="*60)
-    print("🚀 Email Monitor Starting - High Volume Edition")
+    print("🚀 Email Monitor Starting - 24/7 Edition")
     print("="*60)
-    
+
     # Initialize connection pool
     print("📦 Initializing database connection pool...")
-    try:
-        init_connection_pool(min_conn=2, max_conn=10)
-        print("✅ Connection pool initialized")
-    except Exception as e:
-        print(f"⚠️ Connection pool init warning: {e}")
-    
-    # Ensure schema exists
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            init_connection_pool(min_conn=2, max_conn=10)
+            print("✅ Connection pool initialized")
+            break
+        except Exception as e:
+            if attempt < max_retries - 1:
+                print(f"⚠️ Connection pool init failed (attempt {attempt+1}/{max_retries}): {e}")
+                time.sleep(5)
+            else:
+                print(f"❌ Connection pool init failed after {max_retries} attempts: {e}")
+                return
+
     print("🗄️ Ensuring database schema...")
     try:
         ensure_schema()
@@ -640,29 +722,27 @@ def main():
     except Exception as e:
         print(f"❌ Schema error: {e}")
         return
-    
-    # Ensure admin tables exist
+
     ensure_admin_tables()
-    
-    # Acquire initial token
+
     print("🔐 Acquiring Microsoft Graph access token...")
     token_resp = acquire_token_app(
         CLIENT_ID, TENANT_ID, CLIENT_SECRET,
         scopes=["https://graph.microsoft.com/.default"]
     )
+
     if "access_token" not in token_resp:
         print(f"❌ Failed to acquire app token: {token_resp.get('error_description', token_resp)}")
         return
-    
+
     access_token = token_resp["access_token"]
     print("✅ Access token acquired successfully")
-    
-    # Determine list of users to poll
+
     users = []
     if MAILBOX_LIST:
         users = [m.strip() for m in MAILBOX_LIST.split(",") if m.strip()]
         print(f"📬 Using mailboxes from MAILBOX_LIST: {len(users)} mailboxes")
-    
+
     if not users:
         print("⚠️ No MAILBOX_LIST set. Attempting to list all users...")
         try:
@@ -671,14 +751,13 @@ def main():
         except Exception as e:
             print(f"❌ Failed to list users: {e}")
             return
-    
+
     if not users:
         print("❌ No users to poll. Exiting.")
         return
-    
-    # Print initial config
+
     print("\n" + "="*60)
-    print("📊 CONFIGURATION (env defaults; DB can override)")
+    print("📊 CONFIGURATION")
     print("="*60)
     print(f"📬 Mailboxes: {len(users)}")
     for idx, user in enumerate(users[:10], 1):
@@ -687,52 +766,76 @@ def main():
         print(f"  ... and {len(users) - 10} more")
     print(f"⏱️ Poll Interval: {POLL_INTERVAL}s")
     print(f"📧 Max Emails/Poll: {MAX_EMAILS_PER_POLL}")
-    print(f"📅 Lookback Days: {LOOKBACK_DAYS}")
+    print(f"📅 Lookback Days: {LOOKBACK_DAYS} (1 month)")
     print(f"👁️ Fetch Read: {FETCH_READ_EMAILS}")
+    print(f"🚫 Excluded Domains: {len(ALL_EXCLUDED_DOMAINS)}")
     print(f"🔍 Debug CC: {DEBUG_CC}")
     print(f"🤖 Model Dir: {MODEL_DIR}")
     print(f"🔴 Neg Threshold: {NEG_PROB_THRESH}")
     print("="*60 + "\n")
-    
+
     loop_count = 0
-    
-    try:
-        while True:
-            loop_count += 1
-            loop_start = time.time()
-            
+
+    while True:
+        loop_count += 1
+        loop_start = time.time()
+
+        try:
             print(f"\n{'='*60}")
             print(f"🔄 CYCLE #{loop_count} - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
             print(f"{'='*60}")
-            
+
             # Refresh token
-            token_resp = acquire_token_app(
-                CLIENT_ID, TENANT_ID, CLIENT_SECRET,
-                scopes=["https://graph.microsoft.com/.default"]
-            )
-            if "access_token" in token_resp:
-                access_token = token_resp["access_token"]
-            
-            # Fetch dynamic settings & caution words
-            settings = fetch_settings_from_db()
-            caution_words = fetch_caution_words_from_db()
-            
-            # Apply dynamic overrides with safe parsing
+            token_acquired = False
+            for token_attempt in range(3):
+                try:
+                    token_resp = acquire_token_app(
+                        CLIENT_ID, TENANT_ID, CLIENT_SECRET,
+                        scopes=["https://graph.microsoft.com/.default"]
+                    )
+
+                    if "access_token" in token_resp:
+                        access_token = token_resp["access_token"]
+                        token_acquired = True
+                        break
+                    else:
+                        print(f"⚠️ Token acquisition failed (attempt {token_attempt+1}/3): {token_resp.get('error_description', 'Unknown error')}")
+                        time.sleep(5)
+                except Exception as e:
+                    print(f"⚠️ Token acquisition exception (attempt {token_attempt+1}/3): {e}")
+                    time.sleep(5)
+
+            if not token_acquired:
+                print("❌ Failed to acquire token after 3 attempts. Retrying in next cycle...")
+                stats['errors'] += 1
+                stats['consecutive_errors'] += 1
+                time.sleep(max(10, POLL_INTERVAL))
+                continue
+
+            # Fetch settings
+            try:
+                settings = fetch_settings_from_db()
+                caution_words = fetch_caution_words_from_db()
+            except Exception as e:
+                print(f"⚠️ Failed to fetch settings/caution words: {e}")
+                settings = {}
+                caution_words = []
+
             poll_interval = safe_int(settings.get('poll_interval'), POLL_INTERVAL)
             max_emails = safe_int(settings.get('max_emails_per_poll'), MAX_EMAILS_PER_POLL)
             lookback_days = safe_int(settings.get('lookback_days'), LOOKBACK_DAYS)
             fetch_read = safe_bool(settings.get('fetch_read_emails'), FETCH_READ_EMAILS)
             neg_prob_db = safe_float(settings.get('neg_prob_thresh'), NEG_PROB_THRESH)
             mark_read_setting = safe_bool(settings.get('mark_as_read'), MARK_AS_READ_ENV)
-            
+
             print(f"🔧 Config: poll={poll_interval}s, max={max_emails}, lookback={lookback_days}d, fetch_read={fetch_read}, mark_read={mark_read_setting}, neg_thresh={neg_prob_db}, caution_words={len(caution_words)}")
-            
+
             cycle_processed = 0
-            
-            # Process each mailbox with BATCH OPTIMIZATION
+            cycle_errors = 0
+
             for mailbox_idx, mailbox in enumerate(users, 1):
                 print(f"\n📬 [{mailbox_idx}/{len(users)}] {mailbox}")
-                
+
                 try:
                     msgs = fetch_emails_for_user(
                         access_token,
@@ -744,63 +847,97 @@ def main():
                 except Exception as e:
                     print(f"❌ Fetch error: {e}")
                     stats['errors'] += 1
+                    cycle_errors += 1
                     time.sleep(1)
                     continue
-                
+
                 if not msgs:
                     print(f"  ℹ️ No new emails")
                     continue
-                
+
                 print(f"  📨 Found {len(msgs)} emails")
-                
-                # BATCH CHECK: Get all processed IDs at once
-                msg_ids = [msg.get("id") for msg in msgs if msg.get("id")]
-                processed_ids = get_processed_message_ids(msg_ids)
-                
-                # Process each message
+
+                try:
+                    msg_ids = [msg.get("id") for msg in msgs if msg.get("id")]
+                    processed_ids = get_processed_message_ids(msg_ids)
+                except Exception as e:
+                    print(f"⚠️ Batch check failed: {e}")
+                    processed_ids = set()
+
                 mailbox_processed = 0
                 for msg in msgs:
                     msg_id = msg.get("id")
                     if not msg_id or msg_id in processed_ids:
                         continue
-                    
+
                     try:
                         if process_message(access_token, mailbox, msg, settings, caution_words, skip_duplicate_check=True):
                             mailbox_processed += 1
                             cycle_processed += 1
+                    except KeyboardInterrupt:
+                        raise
                     except Exception as e:
-                        print(f"  ❌ Error processing message: {e}")
+                        print(f"  ❌ Error processing message {msg_id}: {e}")
+                        if DEBUG_CC:
+                            traceback.print_exc()
                         stats['errors'] += 1
-                
+                        cycle_errors += 1
+                        continue
+
                 if mailbox_processed > 0:
                     print(f"  ✅ Processed {mailbox_processed} new emails")
-            
-            # Cycle summary
+
             loop_duration = time.time() - loop_start
             print(f"\n{'='*60}")
             print(f"✅ Cycle #{loop_count} Complete")
             print(f"  📧 Processed: {cycle_processed} new emails")
+            print(f"  🚫 Filtered: {stats['filtered_out']} total")
+            print(f"  ❌ Errors this cycle: {cycle_errors}")
             print(f"  ⏱️ Duration: {loop_duration:.2f}s")
             print(f"{'='*60}")
-            
-            # Print stats every 10 cycles
+
+            if cycle_errors == 0:
+                stats['consecutive_errors'] = 0
+
             if loop_count % 10 == 0:
                 print_stats()
-            
-            # Sleep until next poll
-            print(f"\n😴 Sleeping {poll_interval}s...\n")
-            time.sleep(max(1, poll_interval))
-            
-    except KeyboardInterrupt:
-        print("\n\n" + "="*60)
-        print("⛔ SHUTDOWN - Interrupted by user")
-        print("="*60)
-        print_stats()
-    except Exception as e:
-        print(f"\n\n❌ FATAL ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        print_stats()
+
+            if stats['consecutive_errors'] > 5:
+                sleep_time = min(300, poll_interval * 2)
+                print(f"\n⚠️ High error rate detected. Extended sleep: {sleep_time}s\n")
+            else:
+                sleep_time = max(1, poll_interval)
+
+            print(f"\n😴 Sleeping {sleep_time}s...\n")
+            time.sleep(sleep_time)
+
+        except KeyboardInterrupt:
+            print("\n\n" + "="*60)
+            print("⛔ SHUTDOWN - Interrupted by user")
+            print("="*60)
+            print_stats()
+            break
+
+        except Exception as e:
+            print(f"\n\n❌ ERROR IN CYCLE #{loop_count}: {e}")
+            traceback.print_exc()
+            stats['errors'] += 1
+            stats['consecutive_errors'] += 1
+
+            if stats['consecutive_errors'] > 10:
+                backoff_time = min(600, 30 * stats['consecutive_errors'])
+                print(f"\n⚠️ CRITICAL: Too many consecutive errors ({stats['consecutive_errors']})")
+                print(f"⚠️ Backing off for {backoff_time}s before retry...\n")
+                time.sleep(backoff_time)
+            else:
+                print(f"\n⚠️ Waiting 30s before retry...\n")
+                time.sleep(30)
+
+            continue
+
+    print("\n" + "="*60)
+    print("📊 FINAL STATISTICS")
+    print_stats()
 
 if __name__ == "__main__":
     main()

@@ -1224,6 +1224,301 @@ print("\n📧 Testing Mailjet Configuration...")
 test_mailjet_connection()
 print("="*60 + "\n")
 
+
+# ---------------- CALLBACKS FOR TRENDS & TRANSITIONS PAGE ----------------
+
+@app.callback(
+    Output('trends-pie-chart', 'figure'),
+    Input('data-store', 'data'),
+    Input('date-range-picker', 'start_date'),
+    Input('date-range-picker', 'end_date'),
+    Input('domain-filter', 'value'),
+    Input('sentiment-filter', 'value')
+)
+def update_trends_pie(data_json, start_date, end_date, domain, sentiments):
+    """Update trends pie chart based on filters"""
+    if not data_json:
+        return go.Figure()
+
+    df = pd.read_json(data_json, orient='split')
+
+    if df.empty:
+        return go.Figure()
+
+    # Convert to IST for filtering
+    df['received_date_ist'] = to_ist(df['received_dt']).dt.date
+
+    # Apply date filter
+    if start_date:
+        df = df[df['received_date_ist'] >= pd.to_datetime(start_date).date()]
+    if end_date:
+        df = df[df['received_date_ist'] <= pd.to_datetime(end_date).date()]
+
+    # Apply domain filter
+    if domain and domain != 'All Domains':
+        df = df[df['client_domain'] == domain]
+
+    # Apply sentiment filter
+    if sentiments:
+        df = df[df['final_label'].isin(sentiments)]
+
+    if df.empty:
+        # Return empty chart with message
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No data available for selected filters",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=16)
+        )
+        fig.update_layout(title="Sentiment Distribution", height=400)
+        return fig
+
+    # Create pie chart
+    sent_counts = df['final_label'].value_counts().reset_index()
+    sent_counts.columns = ['Sentiment', 'Count']
+
+    fig = create_pie_chart(
+        sent_counts, 
+        'Count', 
+        'Sentiment', 
+        f"Sentiment Distribution ({len(df)} emails)"
+    )
+
+    return fig
+
+
+@app.callback(
+    Output('journey-content', 'children'),
+    Input('journey-domain-selector', 'value'),
+    Input('data-store', 'data'),
+    Input('date-range-picker', 'start_date'),
+    Input('date-range-picker', 'end_date')
+)
+def update_journey(selected_domain, data_json, start_date, end_date):
+    """Update sentiment journey for selected domain with visual email-to-email journey"""
+    if not selected_domain or not data_json:
+        return html.Div(
+            dbc.Alert("Please select a domain to view sentiment journey", color="info"),
+            className="mt-3"
+        )
+
+    df = pd.read_json(data_json, orient='split')
+
+    if df.empty:
+        return html.Div(
+            dbc.Alert("No data available", color="warning"),
+            className="mt-3"
+        )
+
+    # Filter by domain
+    df_domain = df[df['client_domain'] == selected_domain].copy()
+
+    if df_domain.empty:
+        return html.Div(
+            dbc.Alert(f"No emails found for domain: {selected_domain}", color="warning"),
+            className="mt-3"
+        )
+
+    # Convert to IST and apply date filter
+    df_domain['received_date_ist'] = to_ist(df_domain['received_dt']).dt.date
+
+    if start_date:
+        df_domain = df_domain[df_domain['received_date_ist'] >= pd.to_datetime(start_date).date()]
+    if end_date:
+        df_domain = df_domain[df_domain['received_date_ist'] <= pd.to_datetime(end_date).date()]
+
+    if df_domain.empty:
+        return html.Div(
+            dbc.Alert(f"No emails for {selected_domain} in selected date range", color="warning"),
+            className="mt-3"
+        )
+
+    # Sort by received date
+    df_domain = df_domain.sort_values('received_dt').reset_index(drop=True)
+
+    # Create datetime in IST
+    df_domain['received_datetime_ist'] = to_ist(df_domain['received_dt'])
+
+    # Calculate sentiment statistics
+    total_emails = len(df_domain)
+    neg_count = (df_domain['final_label'] == 'Negative').sum()
+    neu_count = (df_domain['final_label'] == 'Neutral').sum()
+    pos_count = (df_domain['final_label'] == 'Positive').sum()
+
+    neg_pct = (neg_count / total_emails * 100) if total_emails > 0 else 0
+    neu_pct = (neu_count / total_emails * 100) if total_emails > 0 else 0
+    pos_pct = (pos_count / total_emails * 100) if total_emails > 0 else 0
+
+    # Create sentiment journey visualization
+    # Map sentiment to numeric values for Y-axis
+    sentiment_map = {'Negative': -1, 'Neutral': 0, 'Positive': 1}
+    df_domain['sentiment_value'] = df_domain['final_label'].map(sentiment_map)
+
+    # Create the journey chart with email-to-email connections
+    fig_journey = go.Figure()
+
+    # Add line connecting emails
+    fig_journey.add_trace(go.Scatter(
+        x=df_domain['received_datetime_ist'],
+        y=df_domain['sentiment_value'],
+        mode='lines',
+        line=dict(color='lightgray', width=2),
+        showlegend=False,
+        hoverinfo='skip'
+    ))
+
+    # Add colored markers for each email by sentiment
+    for sentiment, color in [('Negative', '#ff4444'), ('Neutral', '#ffa500'), ('Positive', '#00cc00')]:
+        df_sent = df_domain[df_domain['final_label'] == sentiment]
+        if not df_sent.empty:
+            fig_journey.add_trace(go.Scatter(
+                x=df_sent['received_datetime_ist'],
+                y=df_sent['sentiment_value'],
+                mode='markers',
+                name=sentiment,
+                marker=dict(
+                    size=12,
+                    color=color,
+                    line=dict(color='white', width=2),
+                    symbol='circle'
+                ),
+                customdata=df_sent[['sender', 'subject', 'prob_neg']].values,
+                hovertemplate='<b>%{data.name}</b><br>' +
+                             'Time: %{x|%Y-%m-%d %H:%M IST}<br>' +
+                             'From: %{customdata[0]}<br>' +
+                             'Subject: %{customdata[1]}<br>' +
+                             'Neg Prob: %{customdata[2]:.3f}<br>' +
+                             '<extra></extra>'
+            ))
+
+    # Update layout
+    fig_journey.update_layout(
+        title=f"Sentiment Journey for {selected_domain} ({total_emails} emails)",
+        xaxis_title="Timeline (IST)",
+        yaxis=dict(
+            title="Sentiment",
+            tickmode='array',
+            tickvals=[-1, 0, 1],
+            ticktext=['🔴 Negative', '🟡 Neutral', '🟢 Positive'],
+            gridcolor='rgba(128,128,128,0.2)'
+        ),
+        height=500,
+        hovermode='closest',
+        plot_bgcolor='white',
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1
+        )
+    )
+
+    # Add gridlines
+    fig_journey.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)')
+    fig_journey.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)')
+
+    # Build the content
+    content = html.Div([
+        # Statistics cards
+        dbc.Row([
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H6("📧 Total Emails", className="text-muted"),
+                html.H3(f"{total_emails:,}", className="mb-0"),
+                html.Small(f"{df_domain['received_date_ist'].min()} to {df_domain['received_date_ist'].max()}", 
+                          className="text-muted")
+            ]), className="text-center"), width=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H6("🔴 Negative", className="text-muted"),
+                html.H3(f"{neg_count:,}", className="mb-0 text-danger"),
+                html.Div([
+                    html.Span(f"{neg_pct:.1f}%", className="badge bg-danger")
+                ])
+            ]), className="text-center"), width=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H6("🟡 Neutral", className="text-muted"),
+                html.H3(f"{neu_count:,}", className="mb-0 text-warning"),
+                html.Div([
+                    html.Span(f"{neu_pct:.1f}%", className="badge bg-warning")
+                ])
+            ]), className="text-center"), width=3),
+            dbc.Col(dbc.Card(dbc.CardBody([
+                html.H6("🟢 Positive", className="text-muted"),
+                html.H3(f"{pos_count:,}", className="mb-0 text-success"),
+                html.Div([
+                    html.Span(f"{pos_pct:.1f}%", className="badge bg-success")
+                ])
+            ]), className="text-center"), width=3),
+        ], className='mb-4 mt-3'),
+
+        # Sentiment Journey Chart
+        dbc.Card([
+            dbc.CardBody([
+                html.H5("📊 Client Sentiment Journey", className="card-title"),
+                html.P("Each dot represents an email. Follow the line to see sentiment progression over time.", 
+                       className="text-muted small"),
+                dcc.Graph(figure=fig_journey)
+            ])
+        ], className="mb-4"),
+
+        # Recent emails table
+        dbc.Card([
+            dbc.CardBody([
+                html.H5(f"📋 Recent Emails from {selected_domain}", className="card-title mb-3"),
+                dash_table.DataTable(
+                    columns=[
+                        {"name": "Date & Time", "id": "received_datetime_ist"},
+                        {"name": "From", "id": "sender"},
+                        {"name": "Subject", "id": "subject"},
+                        {"name": "Sentiment", "id": "final_label"},
+                        {"name": "Neg Prob", "id": "prob_neg"}
+                    ],
+                    data=df_domain.tail(20)[[
+                        'received_datetime_ist', 'sender', 'subject', 
+                        'final_label', 'prob_neg'
+                    ]].assign(
+                        received_datetime_ist=lambda x: x['received_datetime_ist'].dt.strftime('%Y-%m-%d %H:%M IST'),
+                        prob_neg=lambda x: x['prob_neg'].replace("", 0).astype(float).round(3)
+                    ).to_dict('records'),
+                    page_size=10,
+                    style_table={'overflowX': 'auto'},
+                    style_cell={
+                        'textAlign': 'left', 
+                        'padding': '10px',
+                        'fontFamily': 'sans-serif',
+                        'fontSize': '14px'
+                    },
+                    style_header={
+                        'backgroundColor': 'rgb(230, 230, 230)',
+                        'fontWeight': 'bold'
+                    },
+                    style_data_conditional=[
+                        {
+                            'if': {'filter_query': '{final_label} = "Negative"'},
+                            'backgroundColor': '#ffebee',
+                            'color': '#c62828'
+                        },
+                        {
+                            'if': {'filter_query': '{final_label} = "Positive"'},
+                            'backgroundColor': '#e8f5e9',
+                            'color': '#2e7d32'
+                        },
+                        {
+                            'if': {'filter_query': '{final_label} = "Neutral"'},
+                            'backgroundColor': '#fff8e1',
+                            'color': '#f57f17'
+                        }
+                    ]
+                )
+            ])
+        ])
+    ])
+
+    return content
+
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 8050))
     
