@@ -1,5 +1,5 @@
 # monitor/inference_local.py
-# Local HF transformers inference with FIXED cautionary words logic
+# Enhanced local inference with CONTEXT-AWARE cautionary words logic
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
@@ -11,29 +11,54 @@ DEFAULT_MODEL_DIR = os.getenv("INFERENCE_MODEL_DIR", "/data/model")
 DEFAULT_MAX_LENGTH = int(os.getenv("MAX_LENGTH", "512"))
 DEFAULT_BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
 
-# Default caution keywords (fallback if DB is empty)
+# UPDATED: More focused caution keywords (removed overly generic ones)
 CAUTION_KEYWORDS = [
-    "concern", "concerned", "not entirely", "not satisfied", "slower than expected",
-    "unable to", "could you please", "please update", "i am unhappy", "i'm unhappy",
-    "i was unable", "unresolved", "disappointed", "need an update", "not happy", 
-    "worry", "there are gaps", "missing information", "bad experience", "angry", 
-    "dissatisfied", "frustrated", "issue", "resolve the problem", "urgent", 
-    "complaint", "fix the gaps",
-    "any update", "waiting for your response", "still waiting", "follow up", 
-    "following up", "kindly update", "kindly revert", "please revert", 
-    "waiting since", "any progress", "status update", "need clarity", 
-    "seeking clarification", "pending from your side", "not acceptable", 
-    "below expectations", "not up to the mark", "not working as expected", 
-    "did not receive", "delayed response", "delay in", "taking too long", 
-    "too slow", "still unresolved", "still not fixed", "issue persists", 
-    "recurring issue", "repeat issue", "keeps happening", 
-    "need immediate attention", "urgent action", "needs to be resolved", 
-    "escalate", "escalation", "higher management", "please take action", 
-    "requires attention", "requires correction", "please look into this", 
-    "incomplete", "incorrect information", "incorrect details", "not working", 
-    "does not work", "problem with", "trouble with", "facing trouble", "lack of"
+    # Strong negative sentiment
+    "i am unhappy", "i'm unhappy", "not happy", "not satisfied", "dissatisfied",
+    "disappointed", "unacceptable", "frustrated", "angry", "bad experience",
+    "terrible", "awful", "poor quality",
+    
+    # Unresolved issues with escalation
+    "unresolved", "still not fixed", "issue persists", "still waiting",
+    "weeks now", "no response", "not working", "does not work",
+    "recurring issue", "repeat issue", "keeps happening",
+    
+    # Escalation language
+    "escalate", "escalation", "higher management", "need immediate attention", 
+    "urgent action", "immediate action", "requires urgent", "complaint",
+    
+    # Second thoughts / doubts
+    "second thoughts", "reconsidering", "questioning whether", 
+    "having doubts", "not confident", "losing confidence",
+    
+    # Problems without solutions
+    "problem with", "issue with", "trouble with", "unable to resolve",
+    "gaps in", "missing information", "incomplete", "lack of",
+    "below expectations", "not up to the mark", "not acceptable",
+    
+    # Frustration indicators
+    "very frustrated", "extremely disappointed", "not pleased",
+    "this is unacceptable", "needs to be fixed immediately"
 ]
 
+# Context indicators that suggest NEUTRAL even with keywords
+NEUTRAL_CONTEXT_INDICATORS = [
+    # Explanatory/informative
+    "we were fixing", "we have fixed", "we resolved", "now completed",
+    "has been resolved", "issue is fixed", "working on",
+    
+    # Polite professional
+    "please find attached", "kindly review", "for your reference",
+    "let me know if", "thank you", "thanks", "regards",
+    
+    # Auto-reply templates
+    "out of office", "currently unavailable", "will respond upon my return",
+    "limited access", "away from office",
+    
+    # Status updates (not complaints)
+    "fyi", "for your information", "updating you", "status update",
+    "progress update", "just to inform"
+]
 
 ID2LABEL = {0: "Negative", 1: "Neutral", 2: "Positive"}
 
@@ -65,12 +90,23 @@ def _softmax(logits: np.ndarray) -> np.ndarray:
     ex = np.exp(logits - np.max(logits))
     return ex / ex.sum(axis=-1, keepdims=True)
 
+def has_neutral_context(text: str) -> bool:
+    """
+    Check if text has neutral context indicators.
+    If these are present, likely not a complaint even with caution keywords.
+    """
+    if not text:
+        return False
+    
+    text_lower = text.lower()
+    return any(indicator in text_lower for indicator in NEUTRAL_CONTEXT_INDICATORS)
+
 def contains_caution(text: str, keywords: List[str] = None) -> Tuple[bool, str]:
     """
-    Check if text contains any caution keywords.
+    UPDATED: Context-aware caution keyword detection.
     Returns (has_keyword, matched_keyword)
     
-    FIXED: Normalizes both text and keywords to lowercase for matching
+    Now checks for neutral context before flagging as cautionary.
     """
     if keywords is None:
         keywords = CAUTION_KEYWORDS
@@ -78,15 +114,25 @@ def contains_caution(text: str, keywords: List[str] = None) -> Tuple[bool, str]:
     if not text or not keywords:
         return False, ""
     
-    # Normalize text to lowercase
     text_lower = text.lower()
     
-    # Check each keyword (normalize to lowercase)
+    # Check for neutral context first
+    has_neutral = has_neutral_context(text)
+    
+    # Check each keyword
     for kw in keywords:
         if not kw:
             continue
         kw_lower = str(kw).strip().lower()
         if kw_lower and kw_lower in text_lower:
+            # If neutral context present, don't flag generic keywords
+            if has_neutral and kw_lower in [
+                "concern", "urgent", "please update", "delay", "issue",
+                "follow up", "following up", "any update"
+            ]:
+                continue  # Skip - neutral context overrides
+            
+            # Otherwise, flag as cautionary
             return True, kw
     
     return False, ""
@@ -95,29 +141,66 @@ def apply_caution_postprocess(pred_idx: int,
                               probs: np.ndarray, 
                               text: str,
                               keywords: List[str] = None,
-                              neg_prob_thresh: float = 0.06) -> Tuple[int, str]:
+                              neg_prob_thresh: float = 0.10) -> Tuple[int, str]:
     """
-    Apply cautionary keyword override logic.
+    UPDATED: More intelligent cautionary keyword override logic.
     
-    FIXED LOGIC:
-    - If caution keyword is found AND prediction is NOT negative -> force to Negative
-    - The neg_prob_thresh is now optional - keyword presence is primary trigger
+    New rules:
+    1. If model predicts Negative, trust it (no override needed)
+    2. If model predicts Positive, be VERY careful - only override if strong evidence
+    3. If model predicts Neutral:
+       - Check for neutral context first
+       - If neutral context exists, keep as Neutral
+       - If caution keyword + sufficient neg probability -> flag as Negative
     """
     if keywords is None:
         keywords = CAUTION_KEYWORDS
     
     p_neg = float(probs[0])
+    p_neu = float(probs[1])
+    p_pos = float(probs[2])
+    
+    # If already predicted Negative, trust the model
+    if pred_idx == 0:
+        return pred_idx, "original"
+    
+    # Check for caution keywords
     has_kw, matched_kw = contains_caution(text, keywords)
     
-    # NEW LOGIC: If caution keyword found and prediction is Neutral or Positive
-    if has_kw and pred_idx in [1, 2]:
-        # Force to negative regardless of threshold
-        # (threshold is just for logging/debugging now)
-        return 0, f"caution_keyword:{matched_kw}(p_neg={p_neg:.3f})"
+    if not has_kw:
+        return pred_idx, "original"
     
-    # Alternative stricter logic (uncomment if you want threshold requirement):
-    # if has_kw and pred_idx in [1, 2] and p_neg >= neg_prob_thresh:
-    #     return 0, f"caution_keyword:{matched_kw}(p_neg={p_neg:.3f})"
+    # Has caution keyword - now decide based on context and probabilities
+    
+    # If Positive prediction - be VERY conservative
+    if pred_idx == 2:
+        # Only override if VERY HIGH negative probability AND strong negative keywords
+        strong_negative_kws = [
+            "unacceptable", "disappointed", "frustrated", "angry", 
+            "second thoughts", "reconsidering", "escalate", "complaint"
+        ]
+        has_strong_kw = any(kw in text.lower() for kw in strong_negative_kws)
+        
+        if has_strong_kw and p_neg >= 0.25:  # High threshold for Positive override
+            return 0, f"caution_keyword:{matched_kw}(p_neg={p_neg:.3f},strong_override)"
+        
+        return pred_idx, "original"  # Keep as Positive
+    
+    # If Neutral prediction - apply intelligent override
+    if pred_idx == 1:
+        # Check neutral context
+        if has_neutral_context(text):
+            # Neutral context present - keep as Neutral unless VERY negative
+            if p_neg >= 0.30:  # Very high threshold
+                return 0, f"caution_keyword:{matched_kw}(p_neg={p_neg:.3f},override_despite_context)"
+            return pred_idx, "neutral_context_preserved"
+        
+        # No neutral context - apply override if neg probability sufficient
+        if p_neg >= neg_prob_thresh:
+            return 0, f"caution_keyword:{matched_kw}(p_neg={p_neg:.3f})"
+        
+        # Neg probability too low - keep as Neutral
+        return pred_idx, f"neutral_kept(p_neg={p_neg:.3f}<{neg_prob_thresh})"
     
     return pred_idx, "original"
 
@@ -126,11 +209,11 @@ def classify_texts(texts: List[str],
                    max_length: int = DEFAULT_MAX_LENGTH,
                    batch_size: int = DEFAULT_BATCH_SIZE,
                    apply_rule: bool = True,
-                   neg_prob_thresh: float = 0.06,
+                   neg_prob_thresh: float = 0.10,
                    caution_keywords: List[str] = None
                    ) -> List[Dict]:
     """
-    Classify multiple texts with optional cautionary keyword override.
+    Classify multiple texts with UPDATED context-aware cautionary keyword override.
     
     Args:
         texts: List of email texts to classify
@@ -138,7 +221,7 @@ def classify_texts(texts: List[str],
         max_length: Max token length
         batch_size: Batch size for inference
         apply_rule: Whether to apply caution keyword override
-        neg_prob_thresh: Negative probability threshold (now optional)
+        neg_prob_thresh: Negative probability threshold (now 0.10 default - higher)
         caution_keywords: List of keywords to check (uses default if None)
     
     Returns:
@@ -194,10 +277,10 @@ def classify_email(text: str,
                    model_dir: str = DEFAULT_MODEL_DIR, 
                    max_length: int = DEFAULT_MAX_LENGTH, 
                    apply_rule: bool = True, 
-                   neg_prob_thresh: float = 0.06, 
+                   neg_prob_thresh: float = 0.10, 
                    caution_keywords: List[str] = None) -> Dict:
     """
-    Classify a single email text.
+    Classify a single email text with context-aware logic.
     
     Returns classification result with cautionary keyword override if applicable.
     """
@@ -222,33 +305,43 @@ def classify_email(text: str,
 # Test script
 if __name__ == "__main__":
     print("="*60)
-    print("Testing Cautionary Keywords Implementation")
+    print("Testing Context-Aware Classification")
     print("="*60)
     
-    # Test samples
+    # Test samples covering different scenarios
     samples = [
-        "Hi team, thank you — the audit report looks great. Well done!",
-        "I am disappointed. The issue reported earlier is unresolved and unacceptable.",
-        "Can you please update the status? I am a bit concerned about the timeline.",
-        "There are gaps in the documentation that need to be addressed.",
-        "Everything looks good, no issues to report."
+        # Should be NEUTRAL (polite professional)
+        "Hi team, please find attached the report for your reference. Thanks!",
+        
+        # Should be NEUTRAL (explanatory)
+        "Sorry for the delay in submission, we were fixing some issues. All reconciliation entries are now posted.",
+        
+        # Should be NEUTRAL (auto-reply with "urgent")
+        "I am out of office with limited access. If your concern is urgent, please contact the team.",
+        
+        # Should be NEGATIVE (real concern needing attention)
+        "I'm disappointed with the delay. This issue needs immediate attention and resolution.",
+        
+        # Should be NEGATIVE (second thoughts)
+        "We're having second thoughts about proceeding with this engagement given the ongoing delays.",
+        
+        # Should be NEGATIVE (unresolved frustration)
+        "This has been unresolved for weeks now. Very frustrated with the lack of progress.",
+        
+        # Should be POSITIVE
+        "Thank you for the excellent work! The audit report looks great. Well done!"
     ]
     
-    # Test with default keywords
-    print("\n--- Testing with default keywords ---")
-    out = classify_texts(samples, apply_rule=True)
-    for t, r in zip(samples, out):
-        print(f"\nTEXT: {t[:100]}")
-        print(f"Prediction: {r['pred_label']} (probs: {[f'{p:.3f}' for p in r['probs']]})")
-        print(f"Final: {r['final_label']} - {r['postprocess_reason']}")
-        print("-" * 60)
+    expected = [1, 1, 1, 0, 0, 0, 2]  # Expected labels
     
-    # Test with custom keywords
-    print("\n--- Testing with custom keywords ---")
-    custom_keywords = ["gaps", "missing", "incomplete"]
-    out2 = classify_texts(samples, apply_rule=True, caution_keywords=custom_keywords)
-    for t, r in zip(samples, out2):
-        print(f"\nTEXT: {t[:100]}")
-        print(f"Prediction: {r['pred_label']} (probs: {[f'{p:.3f}' for p in r['probs']]})")
-        print(f"Final: {r['final_label']} - {r['postprocess_reason']}")
+    print("\n--- Testing with context-aware logic ---")
+    results = classify_texts(samples, apply_rule=True, neg_prob_thresh=0.10)
+    
+    for i, (text, result, exp) in enumerate(zip(samples, results, expected), 1):
+        correct = "✅" if result['final_idx'] == exp else "❌"
+        print(f"\n{correct} Sample {i}:")
+        print(f"Text: {text[:100]}")
+        print(f"Model: {result['pred_label']} → Final: {result['final_label']}")
+        print(f"Probs: Neg={result['probs'][0]:.3f}, Neu={result['probs'][1]:.3f}, Pos={result['probs'][2]:.3f}")
+        print(f"Reason: {result['postprocess_reason']}")
         print("-" * 60)
