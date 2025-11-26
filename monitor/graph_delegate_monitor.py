@@ -8,6 +8,7 @@
 # 2. Changed default lookback to 30 days to fetch past 1 month of emails
 # 3. Added domain filtering to exclude bank mails and ads (youtube, substack, etc.)
 # 4. Fixed pandas SQLAlchemy warnings by replacing pd.read_sql_query with cursor operations
+# 5. NEW: Added sender-prefix filtering (marketing@, newsletter@, etc.)
 
 import os
 import time
@@ -38,7 +39,7 @@ EXCLUDED_DOMAINS_ENV = os.getenv("EXCLUDED_DOMAINS", "")
 # Default excluded domains - banks and ads
 DEFAULT_EXCLUDED_DOMAINS = [
     # Indian Banks
-    "icicibank.com", "hdfcbank.com", "sbi.co.in", "axisbank.com", 
+    "icicibank.com", "hdfcbank.com", "sbi.co.in", "axisbank.com",
     "kotak.com", "yesbank.in", "pnbindia.in", "bankofbaroda.in",
     "indusind.com", "rbl.com", "idfcfirstbank.com",
 
@@ -57,7 +58,7 @@ DEFAULT_EXCLUDED_DOMAINS = [
     # Email marketing platforms
     "amazonaws.com", "mailchimp.com", "sendgrid.net",
     "mailgun.org", "postmarkapp.com", "sparkpostmail.com",
-    "mandrillapp.com", "amazonses.com",
+    "mandrillapp.com", "amazonses.com", "founderbrands.io"
 ]
 
 # Combine custom and default excluded domains
@@ -67,7 +68,30 @@ if EXCLUDED_DOMAINS_ENV.strip():
 else:
     ALL_EXCLUDED_DOMAINS = DEFAULT_EXCLUDED_DOMAINS
 
+# NEW: Sender prefix filtering configuration (local-part starts with these)
+EXCLUDED_SENDER_PREFIXES_ENV = os.getenv("EXCLUDED_SENDER_PREFIXES", "")
+
+# Default prefixes to ignore all marketing/newsletter blasts
+DEFAULT_EXCLUDED_SENDER_PREFIXES = [
+    "marketing@",
+    "newsletter@",
+    "offers@",
+    "promotions@",
+    "promo@",
+]
+
+if EXCLUDED_SENDER_PREFIXES_ENV.strip():
+    CUSTOM_EXCLUDED_SENDER_PREFIXES = [
+        p.strip().lower() for p in EXCLUDED_SENDER_PREFIXES_ENV.split(",") if p.strip()
+    ]
+    ALL_EXCLUDED_SENDER_PREFIXES = list(
+        set(DEFAULT_EXCLUDED_SENDER_PREFIXES + CUSTOM_EXCLUDED_SENDER_PREFIXES)
+    )
+else:
+    ALL_EXCLUDED_SENDER_PREFIXES = DEFAULT_EXCLUDED_SENDER_PREFIXES
+
 print(f"🚫 Filtering {len(ALL_EXCLUDED_DOMAINS)} excluded domains")
+print(f"🚫 Filtering {len(ALL_EXCLUDED_SENDER_PREFIXES)} excluded sender prefixes")
 
 # ---------------------------------------------------------------------------------------------
 if not CLIENT_ID or not TENANT_ID or not CLIENT_SECRET:
@@ -97,7 +121,7 @@ except Exception as e:
                     }
 
         # Simple keyword-based classification
-        if any(x in t for x in ("disappoint", "unresolved", "delay", "not happy", "unable", "concern", "issue", "problem", "urgent", "complaint", "frustrated","gaps", "missing", "bad", "angry", "dissatisfied")):
+        if any(x in t for x in ("disappoint", "unresolved", "delay", "not happy", "unable", "concern", "issue", "problem", "urgent", "complaint", "frustrated", "gaps", "missing", "bad", "angry", "dissatisfied")):
             return {"final_label": "Negative", "pred_label": "Negative", "probs": [0.9, 0.08, 0.02], "postprocess_reason": "fallback"}
         if any(x in t for x in ("thank", "great", "well done", "congrat", "excellent", "appreciate", "happy", "pleased")):
             return {"final_label": "Positive", "pred_label": "Positive", "probs": [0.01, 0.05, 0.94], "postprocess_reason": "fallback"}
@@ -115,6 +139,7 @@ stats = {
     'last_success': datetime.utcnow()
 }
 
+
 def update_stats(mailbox, sentiment):
     """Update processing statistics"""
     stats['total_processed'] += 1
@@ -123,12 +148,13 @@ def update_stats(mailbox, sentiment):
     stats['consecutive_errors'] = 0
     stats['last_success'] = datetime.utcnow()
 
+
 def print_stats():
     """Print current statistics"""
     runtime = datetime.utcnow() - stats['start_time']
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("📊 PROCESSING STATISTICS")
-    print("="*60)
+    print("=" * 60)
     print(f"⏱️ Runtime: {runtime}")
     print(f"📧 Total Processed: {stats['total_processed']}")
     print(f"🚫 Filtered Out: {stats['filtered_out']}")
@@ -141,9 +167,17 @@ def print_stats():
     for sentiment, count in stats['by_sentiment'].items():
         emoji = {"Negative": "🔴", "Neutral": "🟡", "Positive": "🟢"}.get(sentiment, "⚪")
         print(f"  {emoji} {sentiment}: {count}")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
-# NEW: Domain filtering function
+
+# ---------------- Domain / sender filtering ----------------
+def extract_domain(email_addr):
+    """Extract domain from email address"""
+    if not email_addr or "@" not in str(email_addr):
+        return ""
+    return str(email_addr).split("@")[-1].lower()
+
+
 def is_excluded_domain(email_addr):
     """Check if email is from an excluded domain"""
     if not email_addr:
@@ -159,6 +193,27 @@ def is_excluded_domain(email_addr):
             return True
 
     return False
+
+
+def is_excluded_sender(email_addr):
+    """
+    Check if a sender should be excluded either because:
+    - The local-part starts with a marketing/newsletter prefix, or
+    - The domain is in the excluded domain list
+    """
+    if not email_addr:
+        return False
+
+    email_str = str(email_addr).strip().lower()
+
+    # Local-part based filter: marketing@..., newsletter@..., etc.
+    for prefix in ALL_EXCLUDED_SENDER_PREFIXES:
+        if email_str.startswith(prefix):
+            return True
+
+    # Domain-based filter (existing logic)
+    return is_excluded_domain(email_str)
+
 
 # ---------------- DB helpers for admin settings & caution words ----------------
 def ensure_admin_tables():
@@ -181,9 +236,9 @@ def ensure_admin_tables():
     VALUES
         ('neg_prob_thresh', '0.06'),
         ('poll_interval', '30'),
-        ('max_emails_per_poll', '50'),
-        ('lookback_days', '30'),
-        ('fetch_read_emails', 'false'),
+        ('max_emails_per_poll', '5000'),
+        ('lookback_days', '60'),
+        ('fetch_read_emails', 'true'),
         ('mark_as_read', 'false')
     ON CONFLICT (key) DO NOTHING;
     """
@@ -195,6 +250,7 @@ def ensure_admin_tables():
         print("✅ Admin tables ensured")
     except Exception as e:
         print(f"⚠️ ensure_admin_tables error: {e}")
+
 
 def fetch_settings_from_db():
     """Return admin settings as dict (key->value). FIXED: No pandas warnings."""
@@ -208,6 +264,7 @@ def fetch_settings_from_db():
         print(f"⚠️ fetch_settings_from_db error: {e}")
         return {}
 
+
 def fetch_caution_words_from_db():
     """Return list[str] of caution words ordered newest-first. FIXED: No pandas warnings."""
     try:
@@ -219,6 +276,7 @@ def fetch_caution_words_from_db():
     except Exception as e:
         print(f"⚠️ fetch_caution_words_from_db error: {e}")
         return []
+
 
 # ---------------- DB helpers for processed table ----------------
 def is_processed(msg_id):
@@ -233,6 +291,7 @@ def is_processed(msg_id):
     except Exception as e:
         print(f"⚠️ DB check error: {e}")
         return False
+
 
 def get_processed_message_ids(message_ids):
     """Batch check which messages are already processed - PERFORMANCE OPTIMIZATION"""
@@ -249,6 +308,7 @@ def get_processed_message_ids(message_ids):
     except Exception as e:
         print(f"⚠️ Batch DB check error: {e}")
         return set()
+
 
 def mark_processed(msg_id, mailbox, sender, receivers, cc, subject, received_dt,
                    web_link, final_label, prob_neg, sender_domain):
@@ -289,6 +349,7 @@ def mark_processed(msg_id, mailbox, sender, receivers, cc, subject, received_dt,
         stats['errors'] += 1
         return False
 
+
 # ---------------- Auth helpers (app-only) ----------------
 def acquire_token_app(client_id, tenant_id, client_secret, scopes):
     """Acquire app-only token for Microsoft Graph"""
@@ -304,9 +365,11 @@ def acquire_token_app(client_id, tenant_id, client_secret, scopes):
         print(f"❌ Token acquisition error: {e}")
         return {}
 
+
 def headers_from_token(token):
     """Create headers with bearer token"""
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+
 
 # ---------------- Graph helpers ----------------
 def fetch_emails_for_user(access_token, user, top=50, fetch_read=False, lookback_days=None):
@@ -378,6 +441,7 @@ def fetch_emails_for_user(access_token, user, top=50, fetch_read=False, lookback
         print(f"❌ Failed to fetch emails for {user}: {e}")
         return []
 
+
 def get_full_message(access_token, mailbox_owner, msg_id):
     """Fetch full message details including headers"""
     url = f"{GRAPH_V1}/users/{mailbox_owner}/messages/{msg_id}"
@@ -391,6 +455,7 @@ def get_full_message(access_token, mailbox_owner, msg_id):
     except requests.exceptions.RequestException as e:
         print(f"⚠️ Failed to fetch full message {msg_id}: {e}")
         return None
+
 
 def mark_as_read(access_token, mailbox_owner, msg_id):
     """Mark email as read in the mailbox"""
@@ -407,6 +472,7 @@ def mark_as_read(access_token, mailbox_owner, msg_id):
     except requests.exceptions.RequestException as e:
         print(f"⚠️ Failed to mark message as read: {e}")
         return False
+
 
 def list_users_app_mode(access_token, top=999):
     """List all users in the tenant"""
@@ -438,13 +504,8 @@ def list_users_app_mode(access_token, top=999):
         print(f"❌ Failed to list users: {e}")
         return []
 
-# ---------------- Utilities ----------------
-def extract_domain(email_addr):
-    """Extract domain from email address"""
-    if not email_addr or "@" not in str(email_addr):
-        return ""
-    return str(email_addr).split("@")[-1].lower()
 
+# ---------------- Utilities ----------------
 def recipients_to_csv(recipients):
     """Convert recipients list to CSV string"""
     out = []
@@ -503,7 +564,9 @@ def recipients_to_csv(recipients):
 
     return ",".join(deduped)
 
+
 EMAIL_RE = re.compile(r'[\w\.-]+@[\w\.-]+\.\w+')
+
 
 def extract_cc(full_message, body_preview=""):
     """Extract CC recipients from message"""
@@ -526,7 +589,7 @@ def extract_cc(full_message, body_preview=""):
                     addrs = []
                     for p in parts:
                         if "<" in p and ">" in p:
-                            inside = p[p.find("<")+1:p.rfind(">")].strip()
+                            inside = p[p.find("<") + 1:p.rfind(">")].strip()
                             if "@" in inside:
                                 addrs.append(inside)
                             continue
@@ -572,6 +635,7 @@ def extract_cc(full_message, body_preview=""):
 
     return ""
 
+
 def safe_int(value, default):
     """Safely parse int from value"""
     try:
@@ -579,12 +643,14 @@ def safe_int(value, default):
     except (TypeError, ValueError):
         return default
 
+
 def safe_float(value, default):
     """Safely parse float from value"""
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
+
 
 def safe_bool(value, default):
     """Safely parse bool from value"""
@@ -594,9 +660,10 @@ def safe_bool(value, default):
         return value
     return str(value).lower() in ('1', 'true', 'yes')
 
+
 # ---------------- Main Processing ----------------
 def process_message(access_token, mailbox, msg_basic, settings, caution_words, skip_duplicate_check=False):
-    """Process a single email message with domain filtering"""
+    """Process a single email message with domain & sender-prefix filtering"""
     mid = msg_basic.get("id")
     subj = (msg_basic.get("subject") or "")[:400]
 
@@ -606,7 +673,7 @@ def process_message(access_token, mailbox, msg_basic, settings, caution_words, s
     if not skip_duplicate_check and is_processed(mid):
         return False
 
-    # Extract and check sender domain
+    # Extract and check sender (prefix + domain)
     try:
         fr = msg_basic.get("from")
         sender = ""
@@ -615,12 +682,13 @@ def process_message(access_token, mailbox, msg_basic, settings, caution_words, s
         elif isinstance(fr, str):
             sender = fr
 
-        if sender and is_excluded_domain(sender):
+        if sender and is_excluded_sender(sender):
             stats['filtered_out'] += 1
             print(f"  🚫 FILTERED: {subj[:60]} (from {sender})")
             return False
     except Exception as e:
-        print(f"⚠️ Error checking sender domain: {e}")
+        print(f"⚠️ Error checking sender domain/prefix: {e}")
+        sender = sender if 'sender' in locals() else ""
 
     # Fetch full message
     try:
@@ -645,9 +713,9 @@ def process_message(access_token, mailbox, msg_basic, settings, caution_words, s
     is_read = full.get("isRead", msg_basic.get("isRead", False))
 
     text_for_classify = (
-        (full.get("subject", "") or subj) +
-        "\n\n" +
-        (full.get("bodyPreview") or msg_basic.get("bodyPreview", "") or "")
+            (full.get("subject", "") or subj) +
+            "\n\n" +
+            (full.get("bodyPreview") or msg_basic.get("bodyPreview", "") or "")
     )
 
     neg_thresh = safe_float(settings.get("neg_prob_thresh") if settings else None, NEG_PROB_THRESH)
@@ -693,11 +761,12 @@ def process_message(access_token, mailbox, msg_basic, settings, caution_words, s
 
     return success
 
+
 # ---------------- Main Loop ----------------
 def main():
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("🚀 Email Monitor Starting - 24/7 Edition")
-    print("="*60)
+    print("=" * 60)
 
     # Initialize connection pool
     print("📦 Initializing database connection pool...")
@@ -709,7 +778,7 @@ def main():
             break
         except Exception as e:
             if attempt < max_retries - 1:
-                print(f"⚠️ Connection pool init failed (attempt {attempt+1}/{max_retries}): {e}")
+                print(f"⚠️ Connection pool init failed (attempt {attempt + 1}/{max_retries}): {e}")
                 time.sleep(5)
             else:
                 print(f"❌ Connection pool init failed after {max_retries} attempts: {e}")
@@ -756,9 +825,9 @@ def main():
         print("❌ No users to poll. Exiting.")
         return
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("📊 CONFIGURATION")
-    print("="*60)
+    print("=" * 60)
     print(f"📬 Mailboxes: {len(users)}")
     for idx, user in enumerate(users[:10], 1):
         print(f"  {idx}. {user}")
@@ -769,10 +838,11 @@ def main():
     print(f"📅 Lookback Days: {LOOKBACK_DAYS} (1 month)")
     print(f"👁️ Fetch Read: {FETCH_READ_EMAILS}")
     print(f"🚫 Excluded Domains: {len(ALL_EXCLUDED_DOMAINS)}")
+    print(f"🚫 Excluded Sender Prefixes: {len(ALL_EXCLUDED_SENDER_PREFIXES)}")
     print(f"🔍 Debug CC: {DEBUG_CC}")
     print(f"🤖 Model Dir: {MODEL_DIR}")
     print(f"🔴 Neg Threshold: {NEG_PROB_THRESH}")
-    print("="*60 + "\n")
+    print("=" * 60 + "\n")
 
     loop_count = 0
 
@@ -781,9 +851,9 @@ def main():
         loop_start = time.time()
 
         try:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"🔄 CYCLE #{loop_count} - {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             # Refresh token
             token_acquired = False
@@ -799,10 +869,10 @@ def main():
                         token_acquired = True
                         break
                     else:
-                        print(f"⚠️ Token acquisition failed (attempt {token_attempt+1}/3): {token_resp.get('error_description', 'Unknown error')}")
+                        print(f"⚠️ Token acquisition failed (attempt {token_attempt + 1}/3): {token_resp.get('error_description', 'Unknown error')}")
                         time.sleep(5)
                 except Exception as e:
-                    print(f"⚠️ Token acquisition exception (attempt {token_attempt+1}/3): {e}")
+                    print(f"⚠️ Token acquisition exception (attempt {token_attempt + 1}/3): {e}")
                     time.sleep(5)
 
             if not token_acquired:
@@ -888,13 +958,13 @@ def main():
                     print(f"  ✅ Processed {mailbox_processed} new emails")
 
             loop_duration = time.time() - loop_start
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"✅ Cycle #{loop_count} Complete")
             print(f"  📧 Processed: {cycle_processed} new emails")
             print(f"  🚫 Filtered: {stats['filtered_out']} total")
             print(f"  ❌ Errors this cycle: {cycle_errors}")
             print(f"  ⏱️ Duration: {loop_duration:.2f}s")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             if cycle_errors == 0:
                 stats['consecutive_errors'] = 0
@@ -912,9 +982,9 @@ def main():
             time.sleep(sleep_time)
 
         except KeyboardInterrupt:
-            print("\n\n" + "="*60)
+            print("\n\n" + "=" * 60)
             print("⛔ SHUTDOWN - Interrupted by user")
-            print("="*60)
+            print("=" * 60)
             print_stats()
             break
 
@@ -935,9 +1005,10 @@ def main():
 
             continue
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("📊 FINAL STATISTICS")
     print_stats()
+
 
 if __name__ == "__main__":
     main()
