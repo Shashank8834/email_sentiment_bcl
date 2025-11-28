@@ -28,9 +28,9 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "30"))
 DEBUG_CC = os.getenv("DEBUG_CC", "False").lower() in ("1", "true", "yes")
 MAILBOX_LIST = os.getenv("MAILBOX_LIST", "")
 MODEL_DIR = os.getenv("INFERENCE_MODEL_DIR", "/data/model")
-FETCH_READ_EMAILS = os.getenv("FETCH_READ_EMAILS", "False").lower() in ("1", "true", "yes")
-MAX_EMAILS_PER_POLL = int(os.getenv("MAX_EMAILS_PER_POLL", "50"))
-LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "30"))  # CHANGED: 7 -> 30 days for past 1 month
+FETCH_READ_EMAILS = os.getenv("FETCH_READ_EMAILS", "True").lower() in ("1", "true", "yes")
+MAX_EMAILS_PER_POLL = int(os.getenv("MAX_EMAILS_PER_POLL", "5000"))
+LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "60"))  # CHANGED: 7 -> 30 days for past 1 month
 MARK_AS_READ_ENV = os.getenv("MARK_AS_READ", "False").lower() in ("1", "true", "yes")
 NEG_PROB_THRESH = float(os.getenv("NEG_PROB_THRESH", "0.06"))
 
