@@ -58,7 +58,7 @@ DEFAULT_EXCLUDED_DOMAINS = [
     # Email marketing platforms
     "amazonaws.com", "mailchimp.com", "sendgrid.net",
     "mailgun.org", "postmarkapp.com", "sparkpostmail.com",
-    "mandrillapp.com", "amazonses.com", "founderbrands.io"
+    "mandrillapp.com", "amazonses.com","founderbrands.io"
 ]
 
 # Combine custom and default excluded domains
@@ -92,6 +92,28 @@ else:
 
 print(f"🚫 Filtering {len(ALL_EXCLUDED_DOMAINS)} excluded domains")
 print(f"🚫 Filtering {len(ALL_EXCLUDED_SENDER_PREFIXES)} excluded sender prefixes")
+
+# NEW: Full email address filtering configuration
+EXCLUDED_EMAILS_ENV = os.getenv("EXCLUDED_EMAILS", "")
+
+# Default excluded email addresses
+DEFAULT_EXCLUDED_EMAILS = [
+    # Add default emails to exclude here
+    # Examples:
+    # "noreply@company.com",
+    # "notifications@service.com",
+]
+
+# Combine custom and default excluded emails
+if EXCLUDED_EMAILS_ENV.strip():
+    CUSTOM_EXCLUDED_EMAILS = [
+        e.strip().lower() for e in EXCLUDED_EMAILS_ENV.split(",") if e.strip()
+    ]
+    ALL_EXCLUDED_EMAILS = list(set(DEFAULT_EXCLUDED_EMAILS + CUSTOM_EXCLUDED_EMAILS))
+else:
+    ALL_EXCLUDED_EMAILS = DEFAULT_EXCLUDED_EMAILS
+
+print(f"🚫 Filtering {len(ALL_EXCLUDED_EMAILS)} excluded email addresses")
 
 # ---------------------------------------------------------------------------------------------
 if not CLIENT_ID or not TENANT_ID or not CLIENT_SECRET:
@@ -197,7 +219,8 @@ def is_excluded_domain(email_addr):
 
 def is_excluded_sender(email_addr):
     """
-    Check if a sender should be excluded either because:
+    Check if a sender should be excluded because:
+    - The full email address is in the excluded list, or
     - The local-part starts with a marketing/newsletter prefix, or
     - The domain is in the excluded domain list
     """
@@ -205,6 +228,10 @@ def is_excluded_sender(email_addr):
         return False
 
     email_str = str(email_addr).strip().lower()
+
+    # Full email address filter (exact match)
+    if email_str in ALL_EXCLUDED_EMAILS:
+        return True
 
     # Local-part based filter: marketing@..., newsletter@..., etc.
     for prefix in ALL_EXCLUDED_SENDER_PREFIXES:
@@ -236,9 +263,9 @@ def ensure_admin_tables():
     VALUES
         ('neg_prob_thresh', '0.06'),
         ('poll_interval', '30'),
-        ('max_emails_per_poll', '5000'),
-        ('lookback_days', '60'),
-        ('fetch_read_emails', 'true'),
+        ('max_emails_per_poll', '50'),
+        ('lookback_days', '30'),
+        ('fetch_read_emails', 'false'),
         ('mark_as_read', 'false')
     ON CONFLICT (key) DO NOTHING;
     """
@@ -839,6 +866,7 @@ def main():
     print(f"👁️ Fetch Read: {FETCH_READ_EMAILS}")
     print(f"🚫 Excluded Domains: {len(ALL_EXCLUDED_DOMAINS)}")
     print(f"🚫 Excluded Sender Prefixes: {len(ALL_EXCLUDED_SENDER_PREFIXES)}")
+    print(f"🚫 Excluded Email Addresses: {len(ALL_EXCLUDED_EMAILS)}")
     print(f"🔍 Debug CC: {DEBUG_CC}")
     print(f"🤖 Model Dir: {MODEL_DIR}")
     print(f"🔴 Neg Threshold: {NEG_PROB_THRESH}")

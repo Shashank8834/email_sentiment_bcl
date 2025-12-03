@@ -14,6 +14,8 @@ import dash_bootstrap_components as dbc
 import plotly.express as px
 import plotly.graph_objects as go
 from dotenv import load_dotenv
+import json
+from urllib.parse import quote
 
 # DB helpers (must exist in your repo)
 from db_config import get_db_connection, init_connection_pool
@@ -607,10 +609,27 @@ def refresh_data(n_clicks, n_intervals, auto_vals):
         df = load_db()
         settings = fetch_settings_from_db()
         cautions = fetch_caution_words_from_db()
-        return df.to_json(date_format='iso', orient='split'), settings, cautions
+        
+        # FIX: Ensure we always return valid JSON
+        if df.empty:
+            df = pd.DataFrame(columns=[
+                "message_id", "mailbox", "sender", "receivers", "cc", "subject",
+                "final_label", "prob_neg", "web_link", "sender_domain",
+                "processed_at", "received_dt"
+            ])
+        
+        return df.to_json(date_format='iso', orient='split'), settings or {}, cautions or []
     except Exception as e:
         print(f"❌ Error loading data: {e}")
-        return pd.DataFrame().to_json(date_format='iso', orient='split'), {}, []
+        import traceback
+        traceback.print_exc()
+        # Return empty but valid structures
+        empty_df = pd.DataFrame(columns=[
+            "message_id", "mailbox", "sender", "receivers", "cc", "subject",
+            "final_label", "prob_neg", "web_link", "sender_domain",
+            "processed_at", "received_dt"
+        ])
+        return empty_df.to_json(date_format='iso', orient='split'), {}, []
 
 @app.callback(
     Output('auto-refresh', 'interval'),
@@ -658,11 +677,21 @@ def update_sidebar_stats(data_json):
 )
 def render_page(page, data_json):
     if not data_json:
-        return dbc.Alert("No data – check the monitor and database.", color="warning")
+        return dbc.Alert(
+            "Loading data... If this persists, check the monitor and database.", 
+            color="info"
+        )
 
-    df = pd.read_json(data_json, orient='split')
+    try:
+        df = pd.read_json(data_json, orient='split')
+    except Exception as e:
+        return dbc.Alert(f"Error loading data: {e}", color="danger")
+    
     if df.empty:
-        return dbc.Alert("No data available. Start the monitor to collect emails.", color="info")
+        return dbc.Alert(
+            "No data available. Start the monitor to collect emails.", 
+            color="info"
+        )
 
     if page == 'live':
         return live_page_layout(df)
@@ -746,6 +775,19 @@ def live_page_layout(df_all):
     ])
 
     return layout
+
+def get_live_df_from_store(data_json):
+    """Return at most the latest 1000 emails for live page usage."""
+    if not data_json:
+        return pd.DataFrame()
+
+    df = pd.read_json(data_json, orient='split')
+
+    if 'received_dt' in df.columns:
+        df = df.sort_values('received_dt', ascending=False).head(1000)
+
+    return df
+
 
 def trends_layout(df):
     if len(df) > 0:
@@ -884,6 +926,19 @@ def emails_layout(df):
 
     return layout
 
+@app.callback(
+    Output('email-details-content', 'children'),
+    Input('email-sentiment-filter', 'value'),
+    Input('email-mailbox-filter', 'value'),
+    Input('email-search-input', 'value'),
+    Input('email-date-filter-store', 'data'),
+    Input('data-store', 'data'),
+    Input('caution-words-store', 'data'),
+    prevent_initial_call=False
+)
+def update_email_details_content(sentiments, mailbox, search, date_filter, data_json, caution_words):
+    """Update the email details table based on filters"""
+    return email_details(sentiments, mailbox, search, date_filter, data_json, caution_words)
 
 @app.callback(
     Output('data-store', 'data', allow_duplicate=True),
@@ -925,18 +980,21 @@ def load_all_emails(n_clicks, data_json):
     Input('data-store', 'data')
 )
 def update_metrics(selected_mailbox, data_json):
-    if not data_json:
+    df = get_live_df_from_store(data_json)
+    if df.empty:
         return ""
 
-    df = pd.read_json(data_json, orient='split')
     if selected_mailbox != 'All Mailboxes':
         df = df[df['mailbox'] == selected_mailbox]
 
     total = len(df)
-    neg = (df['final_label']=='Negative').sum()
-    neu = (df['final_label']=='Neutral').sum()
-    pos = (df['final_label']=='Positive').sum()
-    avg_neg = df['prob_neg'].replace("",0).astype(float).mean() if total>0 else 0.0
+    neg = (df['final_label'] == 'Negative').sum()
+    neu = (df['final_label'] == 'Neutral').sum()
+    pos = (df['final_label'] == 'Positive').sum()
+    avg_neg = df['prob_neg'].replace("", 0).astype(float).mean() if total > 0 else 0.0
+
+    # ... rest of your existing card layout ...
+
 
     row = dbc.Row([
         dbc.Col(dbc.Card(dbc.CardBody([html.H6("📧 Total Emails"), html.H4(f"{total:,}")]))),
@@ -959,11 +1017,11 @@ def update_metrics(selected_mailbox, data_json):
     Input('data-store', 'data')
 )
 def update_live_charts(selected_mailbox, data_json):
-    if not data_json:
+    df = get_live_df_from_store(data_json)
+    if df.empty:
         return go.Figure(), go.Figure(), go.Figure()
 
-    df = pd.read_json(data_json, orient='split')
-    display = df if selected_mailbox=='All Mailboxes' else df[df['mailbox']==selected_mailbox]
+    display = df if selected_mailbox == 'All Mailboxes' else df[df['mailbox'] == selected_mailbox]
 
     # Overall pie
     sent_counts = display['final_label'].value_counts().reset_index()
@@ -1249,29 +1307,32 @@ def update_domain_view_table(selected_domain, data_json, caution_words, mailbox)
 
     return table, f"Showing {len(disp)} emails for domain: {selected_domain}"
 
-@app.callback(
-    Output('email-details-content','children'),
-    Input('email-sentiment-filter','value'),
-    Input('email-mailbox-filter','value'),
-    Input('email-search-input','value'),
-    Input('email-date-filter-store', 'data'),
-    Input('data-store','data'),
-    Input('caution-words-store','data')
-)
 def email_details(sentiments, mailbox, search, date_filter, data_json, caution_words):
-    if not data_json:
-        return html.Div()
+    """
+    Detailed email table.
+    """
+    # If custom range is active, bypass the 1000-row cache and hit DB
+    if date_filter and date_filter.get('filter_type') == 'custom':
+        try:
+            df = load_db(limit=12000)
+        except Exception as e:
+            return dbc.Alert(
+                f"Error loading data for custom range: {e}",
+                color="danger"
+            )
+    else:
+        if not data_json:
+            return html.Div()
+        df = pd.read_json(data_json, orient='split')
 
-    df = pd.read_json(data_json, orient='split')
     detail_df = df.copy()
 
-    # Apply date filtering
-    if date_filter and date_filter.get('filter_type') != 'all':
+    # Apply date filtering - FIX: handle None date_filter
+    if date_filter and date_filter.get('filter_type') and date_filter.get('filter_type') != 'all':
         start_date = date_filter.get('start_date')
         end_date = date_filter.get('end_date')
 
         if start_date and end_date:
-            # Convert received_dt to IST date for filtering
             detail_df['received_date_ist'] = to_ist(detail_df['received_dt']).dt.date
 
             start_date_obj = pd.to_datetime(start_date).date()
@@ -1281,24 +1342,31 @@ def email_details(sentiments, mailbox, search, date_filter, data_json, caution_w
                 (detail_df['received_date_ist'] >= start_date_obj) &
                 (detail_df['received_date_ist'] <= end_date_obj)
             ]
+    
 
+    # Sentiment filter
     if sentiments:
         detail_df = detail_df[detail_df['final_label'].isin(sentiments)]
 
+    # Mailbox filter
     if mailbox and mailbox != 'All Mailboxes':
-        detail_df = detail_df[detail_df['mailbox']==mailbox]
+        detail_df = detail_df[detail_df['mailbox'] == mailbox]
 
+    # Text search across subject / sender / receivers
     if search and search.strip():
         q = search.lower()
-        detail_df = detail_df[detail_df['subject'].fillna('').str.lower().str.contains(q) |
-                             detail_df['sender'].fillna('').str.lower().str.contains(q) |
-                             detail_df['receivers'].fillna('').str.lower().str.contains(q)]
+        detail_df = detail_df[
+            detail_df['subject'].fillna('').str.lower().str.contains(q) |
+            detail_df['sender'].fillna('').str.lower().str.contains(q) |
+            detail_df['receivers'].fillna('').str.lower().str.contains(q)
+        ]
 
     if detail_df.empty:
         return dbc.Alert("No emails match the current filters", color='info')
 
-    disp = detail_df[['received_dt','client_domain','mailbox','sender','subject',
-                     'final_label','prob_neg','web_link']].copy()
+    # Build display table
+    disp = detail_df[['received_dt', 'client_domain', 'mailbox', 'sender', 'subject',
+                      'final_label', 'prob_neg', 'web_link']].copy()
     disp['received_dt'] = format_ist(disp['received_dt'])
 
     # Caution highlighting
@@ -1315,35 +1383,42 @@ def email_details(sentiments, mailbox, search, date_filter, data_json, caution_w
                     subject_display.append("⚠️ " + subj)
                 else:
                     subject_display.append(subj)
-            disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s 
-                                   for s, wl in zip(subject_display, disp['web_link'])]
+            disp['subject_html'] = [
+                f"[{s}]({wl})" if wl and str(wl).strip() else s
+                for s, wl in zip(subject_display, disp['web_link'])
+            ]
         else:
-            disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s 
-                                   for s, wl in zip(disp['subject'].fillna(''), disp['web_link'])]
+            disp['subject_html'] = [
+                f"[{s}]({wl})" if wl and str(wl).strip() else s
+                for s, wl in zip(disp['subject'].fillna(''), disp['web_link'])
+            ]
     else:
-        disp['subject_html'] = [f"[{s}]({wl})" if wl and str(wl).strip() else s 
-                               for s, wl in zip(disp['subject'].fillna(''), disp['web_link'])]
+        disp['subject_html'] = [
+            f"[{s}]({wl})" if wl and str(wl).strip() else s
+            for s, wl in zip(disp['subject'].fillna(''), disp['web_link'])
+        ]
 
     table = dash_table.DataTable(
         columns=[
-            {"name":"Received","id":"received_dt"},
-            {"name":"Client","id":"client_domain"},
-            {"name":"Mailbox","id":"mailbox"},
-            {"name":"From","id":"sender"},
-            {"name":"Subject","id":"subject_html","presentation":"markdown"},
-            {"name":"Sentiment","id":"final_label"},
-            {"name":"Neg Prob","id":"prob_neg"}
+            {"name": "Received", "id": "received_dt"},
+            {"name": "Client", "id": "client_domain"},
+            {"name": "Mailbox", "id": "mailbox"},
+            {"name": "From", "id": "sender"},
+            {"name": "Subject", "id": "subject_html", "presentation": "markdown"},
+            {"name": "Sentiment", "id": "final_label"},
+            {"name": "Neg Prob", "id": "prob_neg"},
         ],
         data=disp.to_dict('records'),
         page_size=15,
-        style_table={'overflowX':'auto'},
-        style_cell={'textAlign':'left','padding':'6px'},
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'left', 'padding': '6px'},
         style_data_conditional=[
-            {'if': {'filter_query': '{final_label} = "Negative"'}, 'backgroundColor':'#fff0f0'}
+            {'if': {'filter_query': '{final_label} = "Negative"'}, 'backgroundColor': '#fff0f0'}
         ]
     )
 
     csv_bytes = detail_df.to_csv(index=False).encode('utf-8')
+
     return html.Div([
         table,
         html.Br(),
@@ -1370,14 +1445,21 @@ def email_details(sentiments, mailbox, search, date_filter, data_json, caution_w
     Input('email-custom-date-range', 'start_date'),
     Input('email-custom-date-range', 'end_date'),
     State('email-date-filter-store', 'data'),
-    prevent_initial_call=True
+    prevent_initial_call=False  # CHANGED: Allow initial call
 )
-def update_date_filter(today_clicks, week_clicks, month_clicks, custom_clicks, 
+def update_date_filter(today_clicks, week_clicks, month_clicks, custom_clicks,
                        custom_start, custom_end, current_state):
     """Handle date filter button clicks and custom date range selection"""
+    
+    # FIX: Handle initial load
+    if current_state is None:
+        current_state = {'filter_type': 'all', 'start_date': None, 'end_date': None}
+    
     ctx = dash.callback_context
     if not ctx.triggered:
         return current_state, True, True, True, True, {'display': 'none'}
+
+    # Rest remains the same...
 
     triggered_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
@@ -1385,7 +1467,7 @@ def update_date_filter(today_clicks, week_clicks, month_clicks, custom_clicks,
     now_ist = get_current_ist()
     today = now_ist.date()
 
-    # Calculate date ranges
+    # Today
     if triggered_id == 'date-btn-today':
         filter_data = {
             'filter_type': 'today',
@@ -1394,8 +1476,8 @@ def update_date_filter(today_clicks, week_clicks, month_clicks, custom_clicks,
         }
         return filter_data, False, True, True, True, {'display': 'none'}
 
-    elif triggered_id == 'date-btn-week':
-        # Calculate start of current week (Monday)
+    # This week
+    if triggered_id == 'date-btn-week':
         start_of_week = today - timedelta(days=today.weekday())
         filter_data = {
             'filter_type': 'week',
@@ -1404,8 +1486,8 @@ def update_date_filter(today_clicks, week_clicks, month_clicks, custom_clicks,
         }
         return filter_data, True, False, True, True, {'display': 'none'}
 
-    elif triggered_id == 'date-btn-month':
-        # Calculate start of current month
+    # This month
+    if triggered_id == 'date-btn-month':
         start_of_month = today.replace(day=1)
         filter_data = {
             'filter_type': 'month',
@@ -1414,12 +1496,13 @@ def update_date_filter(today_clicks, week_clicks, month_clicks, custom_clicks,
         }
         return filter_data, True, True, False, True, {'display': 'none'}
 
-    elif triggered_id == 'date-btn-custom':
-        # Show custom date picker
+    # Custom range button: just show picker, don't change filter yet
+    if triggered_id == 'date-btn-custom':
         return current_state, True, True, True, False, {'display': 'block'}
 
-    elif triggered_id == 'email-custom-date-range':
-        # Custom date range selected
+    # Custom picker changed (start or end)
+    if 'email-custom-date-range' in ctx.triggered[0]['prop_id']:
+        # Only APPLY custom filter once BOTH dates are set
         if custom_start and custom_end:
             filter_data = {
                 'filter_type': 'custom',
@@ -1428,6 +1511,10 @@ def update_date_filter(today_clicks, week_clicks, month_clicks, custom_clicks,
             }
             return filter_data, True, True, True, False, {'display': 'block'}
 
+        # User is still picking the range; keep picker open, keep old filter
+        return current_state, True, True, True, False, {'display': 'block'}
+
+    # Fallback
     return current_state, True, True, True, True, {'display': 'none'}
 
 @app.callback(
@@ -1489,44 +1576,66 @@ def update_trends_pie(data_json, start_date, end_date, domain, sentiments):
 @app.callback(
     Output('journey-content', 'children'),
     Input('journey-domain-selector', 'value'),
-    Input('data-store', 'data'),
     Input('date-range-picker', 'start_date'),
     Input('date-range-picker', 'end_date')
 )
-def update_journey(selected_domain, data_json, start_date, end_date):
-    if not selected_domain or not data_json:
-        return html.Div(dbc.Alert("Please select a domain to view sentiment journey", color="info"), className="mt-3")
+def update_journey(selected_domain, start_date, end_date):
+    """Fetch journey data directly from DB for the selected date range"""
+    try:
+        with get_db_connection() as conn:
+            query = """
+            SELECT message_id, sender, sender_domain, subject, final_label, 
+                   received_dt, processed_at, prob_neg
+            FROM processed
+            ORDER BY received_dt ASC
+            """
+            df_all = pd.read_sql_query(query, conn)
+    except Exception as e:
+        return dbc.Alert(f"❌ Error loading journey data: {e}", color='danger')
 
-    df = pd.read_json(data_json, orient='split')
-    if df.empty:
-        return html.Div(dbc.Alert("No data available", color="warning"), className="mt-3")
+    if df_all.empty:
+        return dbc.Alert("📭 No data available", color='info')
 
-    df_domain = df[df['client_domain'] == selected_domain].copy()
+    # Fix data types
+    df_all['received_dt'] = pd.to_datetime(df_all['received_dt'], errors='coerce')
+    df_all['prob_neg'] = pd.to_numeric(df_all['prob_neg'], errors='coerce').fillna(0)
+
+    # Filter by domain
+    if selected_domain and selected_domain != "All Domains":
+        df_domain = df_all[df_all['sender_domain'] == selected_domain].copy()
+    else:
+        df_domain = df_all.copy()
+
     if df_domain.empty:
         return html.Div(dbc.Alert(f"No emails found for domain: {selected_domain}", color="warning"), className="mt-3")
 
+    # Convert to IST dates for filtering
     df_domain['received_date_ist'] = to_ist(df_domain['received_dt']).dt.date
     domain_min_date = df_domain['received_date_ist'].min()
     domain_max_date = df_domain['received_date_ist'].max()
 
+    # Apply date filters
     if start_date:
-        df_domain = df_domain[df_domain['received_date_ist'] >= pd.to_datetime(start_date).date()]
+        start_dt = pd.to_datetime(start_date).date()
+        df_domain = df_domain[df_domain['received_date_ist'] >= start_dt]
     if end_date:
-        df_domain = df_domain[df_domain['received_date_ist'] <= pd.to_datetime(end_date).date()]
+        end_dt = pd.to_datetime(end_date).date()
+        df_domain = df_domain[df_domain['received_date_ist'] <= end_dt]
 
     if df_domain.empty:
         return html.Div([
-            dbc.Alert(f"No emails for {selected_domain} in selected date range ({start_date} to {end_date})", 
-                     color="warning"),
+            dbc.Alert(f"No emails for {selected_domain} in selected date range", color="warning"),
             html.Div([
                 html.P(f"Available date range for this domain: {domain_min_date} to {domain_max_date}", 
                       className="text-muted small")
             ])
         ], className="mt-3")
 
+    # Prepare data for graph
     df_domain = df_domain.sort_values('received_dt').reset_index(drop=True)
     df_domain['received_datetime_ist'] = to_ist(df_domain['received_dt'])
 
+    # Calculate stats
     total_emails = len(df_domain)
     neg_count = (df_domain['final_label'] == 'Negative').sum()
     neu_count = (df_domain['final_label'] == 'Neutral').sum()
@@ -1535,25 +1644,34 @@ def update_journey(selected_domain, data_json, start_date, end_date):
     neg_pct = (neg_count / total_emails * 100) if total_emails > 0 else 0
     neu_pct = (neu_count / total_emails * 100) if total_emails > 0 else 0
     pos_pct = (pos_count / total_emails * 100) if total_emails > 0 else 0
-    avg_neg_prob = df_domain['prob_neg'].replace("", 0).astype(float).mean()
+    avg_neg_prob = df_domain['prob_neg'].mean()
 
+    # Create sentiment journey graph
     sentiment_map = {'Negative': -1, 'Neutral': 0, 'Positive': 1}
     df_domain['sentiment_value'] = df_domain['final_label'].map(sentiment_map)
 
     fig_journey = go.Figure()
 
-    fig_journey.add_trace(go.Scatter(
-        x=df_domain['received_datetime_ist'], y=df_domain['sentiment_value'],
-        mode='lines', line=dict(color='lightgray', width=2),
-        showlegend=False, hoverinfo='skip'
-    ))
+    # Add connecting line
+    if not df_domain.empty:
+        fig_journey.add_trace(go.Scatter(
+            x=df_domain['received_datetime_ist'], 
+            y=df_domain['sentiment_value'],
+            mode='lines', 
+            line=dict(color='lightgray', width=2),
+            showlegend=False, 
+            hoverinfo='skip'
+        ))
 
+    # Add markers for each sentiment
     for sentiment, color in [('Negative', '#ff4444'), ('Neutral', '#ffa500'), ('Positive', '#00cc00')]:
         df_sent = df_domain[df_domain['final_label'] == sentiment]
         if not df_sent.empty:
             fig_journey.add_trace(go.Scatter(
-                x=df_sent['received_datetime_ist'], y=df_sent['sentiment_value'],
-                mode='markers', name=sentiment,
+                x=df_sent['received_datetime_ist'], 
+                y=df_sent['sentiment_value'],
+                mode='markers', 
+                name=sentiment,
                 marker=dict(size=12, color=color, line=dict(color='white', width=2)),
                 customdata=df_sent[['sender', 'subject', 'prob_neg']].values,
                 hovertemplate='<b>%{data.name}</b><br>Time: %{x|%Y-%m-%d %H:%M IST}<br>' +
@@ -1576,6 +1694,7 @@ def update_journey(selected_domain, data_json, start_date, end_date):
     fig_journey.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)')
     fig_journey.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(128,128,128,0.2)')
 
+    # Build content
     content = html.Div([
         dbc.Alert([
             html.Div([html.Strong("📅 Active Date Range: "),
@@ -1616,7 +1735,7 @@ def update_journey(selected_domain, data_json, start_date, end_date):
                 data=df_domain.tail(20)[['received_datetime_ist', 'sender', 'subject', 
                                         'final_label', 'prob_neg']].assign(
                     received_datetime_ist=lambda x: x['received_datetime_ist'].dt.strftime('%Y-%m-%d %H:%M IST'),
-                    prob_neg=lambda x: x['prob_neg'].replace("", 0).astype(float).round(3)
+                    prob_neg=lambda x: x['prob_neg'].round(3)
                 ).to_dict('records'),
                 page_size=10,
                 style_table={'overflowX': 'auto'},
@@ -1635,6 +1754,7 @@ def update_journey(selected_domain, data_json, start_date, end_date):
     ])
 
     return content
+
 
 # Test Mailjet
 print("\n" + "="*60)
